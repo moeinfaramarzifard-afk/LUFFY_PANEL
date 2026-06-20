@@ -669,43 +669,37 @@ async def delete_address(index: int, _=Depends(require_auth)):
     await db_delete_address(removed)
     return {"ok": True, "addresses": list(CUSTOM_ADDRESSES)}
 
-PING_TIMEOUT_SECONDS = 5.0
-PING_PORT = 443
+PING_TIMEOUT_SECONDS = 8.0
 
-async def _tcp_ping(address: str) -> dict:
-    """Open a TCP connection to address:443 and measure the time to connect.
-    This mirrors the real-world cost of a VLESS-over-TLS handshake target,
-    so it's a more meaningful signal than ICMP ping for this use case."""
+async def _https_ping(address: str) -> dict:
+    """Measure real-world HTTPS latency to an address: full DNS + TCP + TLS
+    handshake + time-to-first-byte of an HTTP HEAD request. This is closer to
+    what a client actually experiences than a bare TCP SYN/ACK, which can
+    return misleadingly fast if something near the server (a load balancer,
+    firewall, or edge node) answers the handshake without reaching the
+    real backend."""
+    url = f"https://{address}/"
     start = time.monotonic()
-    writer = None
     try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(address, PING_PORT), timeout=PING_TIMEOUT_SECONDS
-        )
+        async with httpx.AsyncClient(timeout=PING_TIMEOUT_SECONDS, verify=False) as client:
+            await client.head(url, follow_redirects=True)
         elapsed_ms = round((time.monotonic() - start) * 1000)
         return {"address": address, "ok": True, "ms": elapsed_ms}
-    except asyncio.TimeoutError:
+    except httpx.TimeoutException:
         return {"address": address, "ok": False, "error": "timeout"}
-    except (OSError, ConnectionError) as exc:
+    except httpx.HTTPError as exc:
         return {"address": address, "ok": False, "error": str(exc) or "connection failed"}
     except Exception as exc:
         return {"address": address, "ok": False, "error": str(exc) or "failed"}
-    finally:
-        if writer is not None:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
 
 @app.post("/api/addresses/ping")
 async def ping_addresses(_=Depends(require_auth)):
-    """Test TCP-connect latency to port 443 for every saved custom address, in parallel."""
+    """Test real HTTPS latency (DNS + TCP + TLS + TTFB) for every saved custom address, in parallel."""
     async with CUSTOM_ADDRESSES_LOCK:
         addresses = list(CUSTOM_ADDRESSES)
     if not addresses:
         return {"results": []}
-    results = await asyncio.gather(*(_tcp_ping(addr) for addr in addresses))
+    results = await asyncio.gather(*(_https_ping(addr) for addr in addresses))
     return {"results": results}
 
 @app.get("/api/backup")
