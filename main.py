@@ -5,6 +5,7 @@ import hashlib
 import secrets
 import time
 import re
+import base64
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 from collections import deque, defaultdict
@@ -38,7 +39,7 @@ connections: dict = {}
 connections_lock = asyncio.Lock()
 connection_sockets: dict = {}
 link_ip_map: dict = defaultdict(set)
-SHARE_TOKENS: dict = {}   # token -> {uid, created_at, expires_at, used}
+SHARE_TOKENS: dict = {}
 stats = {"total_bytes": 0, "total_requests": 0, "total_errors": 0, "start_time": time.time()}
 error_logs: deque = deque(maxlen=50)
 hourly_traffic: dict = defaultdict(int)
@@ -52,9 +53,7 @@ CUSTOM_ADDRESSES_LOCK = asyncio.Lock()
 
 SESSION_COOKIE = "ren_session"
 SESSION_TTL = 60 * 60 * 24 * 7
-UNLIMITED_QUOTA_BYTES = 53687091200000
 
-# ── Persistence (SQLite) ───────────────────────────────────────────────────────
 DB_LOCK = asyncio.Lock()
 
 def _db_conn():
@@ -146,7 +145,6 @@ async def flush_usage_to_db():
         except Exception:
             logger.exception("usage flush failed")
 
-# ── Telegram notifications ─────────────────────────────────────────────────────
 async def telegram_notify(text: str):
     token, chat_id = CONFIG["tg_token"], CONFIG["tg_chat_id"]
     if not token or not chat_id:
@@ -186,7 +184,6 @@ async def quota_expiry_watcher():
         except Exception:
             logger.exception("quota/expiry watcher failed")
 
-# ── Auth ─────────────────────────────────────────────────────────────────────
 def hash_password(pw: str) -> str:
     return hashlib.sha256(f"{pw}{CONFIG['secret']}".encode()).hexdigest()
 
@@ -221,7 +218,6 @@ async def require_auth(request: Request):
         raise HTTPException(status_code=401, detail="unauthorized")
     return token
 
-# ── Keep-alive ────────────────────────────────────────────────────────────────
 async def keep_alive():
     while True:
         await asyncio.sleep(600)
@@ -264,7 +260,6 @@ async def shutdown():
     if http_client:
         await http_client.aclose()
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
 def get_domain() -> str:
     return (
         os.environ.get("RENDER_EXTERNAL_URL", os.environ.get("RAILWAY_PUBLIC_DOMAIN", "localhost"))
@@ -306,13 +301,6 @@ def parse_expires_at(raw: str | None) -> datetime | None:
     except Exception:
         return None
 
-def seconds_until_expiry(expires_at_str: str | None) -> int | None:
-    exp = parse_expires_at(expires_at_str)
-    if exp is None:
-        return None
-    remaining = (exp - datetime.now(timezone.utc)).total_seconds()
-    return max(0, int(remaining))
-
 async def ensure_default_link():
     created = False
     async with LINKS_LOCK:
@@ -350,10 +338,9 @@ async def close_connections_for_link(uid: str):
     async with connections_lock:
         link_ip_map.pop(uid, None)
 
-# ── Routes ────────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"service": "Luffy Panel", "version": "1.0", "status": "active", "domain": get_domain()}
+    return RedirectResponse(url="/login")
 
 @app.get("/health")
 async def health():
@@ -464,9 +451,32 @@ async def delete_link(uid: str, _=Depends(require_auth)):
     await db_delete_link(uid)
     return {"ok": True}
 
+@app.get("/api/addresses")
+async def list_addresses(_=Depends(require_auth)):
+    async with CUSTOM_ADDRESSES_LOCK:
+        return {"addresses": list(CUSTOM_ADDRESSES)}
+
+@app.post("/api/addresses")
+async def add_address(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    addr = str(body.get("address") or "").strip()
+    if addr:
+        async with CUSTOM_ADDRESSES_LOCK:
+            if addr not in CUSTOM_ADDRESSES:
+                CUSTOM_ADDRESSES.append(addr)
+        await db_save_address(addr)
+    return {"ok": True}
+
+@app.delete("/api/addresses/{addr}")
+async def delete_address(addr: str, _=Depends(require_auth)):
+    async with CUSTOM_ADDRESSES_LOCK:
+        if addr in CUSTOM_ADDRESSES:
+            CUSTOM_ADDRESSES.remove(addr)
+    await db_delete_address(addr)
+    return {"ok": True}
+
 @app.get("/sub/{uid}")
 async def subscription_endpoint(uid: str):
-    import base64
     async with LINKS_LOCK:
         link = LINKS.get(uid)
     if not link or not link["active"]:
@@ -475,7 +485,6 @@ async def subscription_endpoint(uid: str):
     encoded = base64.b64encode(vless.encode()).decode()
     return Response(content=encoded, headers={"Content-Type": "text/plain"})
 
-# ── Standalone Page Builder ───────────────────────────────────────────────────
 def _public_page(title: str, body: str) -> str:
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
@@ -513,18 +522,318 @@ async def view_share_link(token: str):
     <button class="copybtn" onclick="cp()">Copy Config</button>"""
     return HTMLResponse(_public_page("Config", body))
 
-# ── PANEL HTML ─────────────────────────────────────────────────────────────
-PANEL_HTML = """<!DOCTYPE html><html><head><title>Luffy Admin Dashboard</title></head>
-<body style="background:#0F0F11;color:#E1E1E6;font-family:sans-serif;padding:40px;">
-<h2>Luffy Core Server Gateway</h2><p>Server-side authentication and gateway management running successfully.</p>
-</body></html>"""
+# ── PANEL_HTML (المان‌ها و رابط کاربری گرافیکی) ──────────────────────────────
+PANEL_HTML = """<!DOCTYPE html>
+<html lang="en" data-theme="dark" data-lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Luffy Server Gateway Dashboard</title>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@600;700;800&family=Inter:wght@400;500;600;700&family=Vazirmatn:wght@400;700&display=swap" rel="stylesheet">
+<style>
+:root[data-theme="dark"] {
+  --bg-main: #0A0A0B; --bg-card: #131316; --bg-input: #1C1C21;
+  --text-main: #F2F2F3; --text-muted: #8F8F94; --border: rgba(255,255,255,0.06);
+  --accent: #6366F1; --accent-hover: #4F46E5; --danger: #EF4444;
+}
+:root[data-theme="light"] {
+  --bg-main: #FAFAFA; --bg-card: #FFFFFF; --bg-input: #F3F4F6;
+  --text-main: #111827; --text-muted: #6B7280; --border: rgba(0,0,0,0.08);
+  --accent: #4F46E5; --accent-hover: #4338CA; --danger: #DC2626;
+}
+* { margin:0; padding:0; box-sizing:border-box; font-family:'Inter','Vazirmatn',sans-serif; transition: background 0.2s, border 0.2s; }
+body { background: var(--bg-main); color: var(--text-main); min-height: 100vh; padding: 20px; }
+.container { max-width: 1100px; margin: 0 auto; }
+header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
+.logo-area { display: flex; align-items: center; gap: 10px; }
+.logo-icon { background: linear-gradient(135deg, #6366F1, #4338CA); width: 40px; height: 40px; border-radius: 12px; display: flex; align-items: center; justify-content: center; color: white; font-weight: 800; font-family: 'Sora'; }
+.logo-title { font-family: 'Sora'; font-size: 20px; }
+.ctrls { display: flex; gap: 10px; }
+button.btn-sec { background: var(--bg-card); border: 1px solid var(--border); color: var(--text-main); padding: 8px 14px; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 500; }
+button.btn-pri { background: var(--accent); border: none; color: white; padding: 10px 18px; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 600; }
+button.btn-pri:hover { background: var(--accent-hover); }
+.grid-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 30px; }
+.card-stat { background: var(--bg-card); border: 1px solid var(--border); padding: 20px; border-radius: 14px; }
+.card-stat .lbl { font-size: 12px; color: var(--text-muted); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
+.card-stat .val { font-size: 22px; font-weight: 700; font-family: 'Sora', sans-serif; }
+.main-section { background: var(--bg-card); border: 1px solid var(--border); border-radius: 16px; padding: 24px; margin-bottom: 24px; }
+.sec-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+.sec-title { font-family: 'Sora'; font-size: 16px; }
+.link-row { display: flex; justify-content: space-between; align-items: center; padding: 14px 0; border-bottom: 1px solid var(--border); }
+.link-row:last-child { border-bottom: none; }
+.link-meta h4 { font-size: 14px; margin-bottom: 4px; }
+.link-meta p { font-size: 12px; color: var(--text-muted); }
+.link-actions { display: flex; gap: 8px; }
+.modal { position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.6); display:none; align-items:center; justify-content:center; padding:16px; z-index:100; }
+.modal.show { display: flex; }
+.modal-content { background: var(--bg-card); border: 1px solid var(--border); padding: 24px; border-radius: 16px; width: 100%; max-width: 440px; }
+.form-group { margin-bottom: 16px; }
+.form-group label { display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px; }
+.form-group input, .form-group select { width:100%; background:var(--bg-input); border:1px solid var(--border); color:var(--text-main); padding:10px; border-radius:8px; font-size:14px; }
+#login-screen { position:fixed; top:0; left:0; width:100%; height:100%; background:var(--bg-main); z-index:999; display:flex; align-items:center; justify-content:center; padding:20px; }
+.login-box { background:var(--bg-card); border:1px solid var(--border); padding:32px; border-radius:20px; width:100%; max-width:380px; text-align:center; }
+.toast { position:fixed; bottom:20px; right:20px; background:#10B981; color:white; padding:12px 20px; border-radius:8px; font-size:13px; font-weight:600; display:none; z-index:1000; box-shadow:0 10px 15px -3px rgba(0,0,0,0.3); }
+.toast.err { background:#EF4444; }
+[data-lang="fa"] { direction: rtl; text-align: right; }
+[data-lang="fa"] .ctrls, [data-lang="fa"] .link-actions { gap: 8px; }
+</style>
+</head>
+<body>
+
+<div id="login-screen">
+  <div class="login-box">
+    <div class="logo-icon" style="margin:0 auto 16px;">L</div>
+    <h3 style="font-family:'Sora'; margin-bottom:6px;">Luffy Gateway</h3>
+    <p style="color:var(--text-muted); font-size:13px; margin-bottom:24px;">Enter administrative credentials</p>
+    <div class="form-group" style="text-align:left;">
+      <input type="password" id="login-password" placeholder="Password" style="text-align:center;">
+    </div>
+    <button class="btn-pri" style="width:100%; padding:12px;" onclick="doLogin()">Authenticate</button>
+  </div>
+</div>
+
+<div class="container">
+  <header>
+    <div class="logo-area">
+      <div class="logo-icon">L</div>
+      <div class="logo-title">Luffy Panel</div>
+    </div>
+    <div class="ctrls">
+      <button class="btn-sec" onclick="toggleLang()">EN / FA</button>
+      <button class="btn-sec" onclick="toggleTheme()">☀️/🌙</button>
+      <button class="btn-sec" onclick="doLogout()" data-i18n="logout">Logout</button>
+    </div>
+  </header>
+
+  <div class="grid-stats">
+    <div class="card-stat"><div class="lbl" data-i18n="st-conn">Active Connections</div><div class="val" id="st-conn-v">-</div></div>
+    <div class="card-stat"><div class="lbl" data-i18n="st-traffic">Total Traffic</div><div class="val" id="st-traffic-v">-</div></div>
+    <div class="card-stat"><div class="lbl" data-i18n="st-cpu">CPU Load</div><div class="val" id="st-cpu-v">-</div></div>
+    <div class="card-stat"><div class="lbl" data-i18n="st-mem">Memory Usage</div><div class="val" id="st-mem-v">-</div></div>
+  </div>
+
+  <div class="main-section">
+    <div class="sec-head">
+      <div class="sec-title" data-i18n="links-title">Client Inbounds & Metrics</div>
+      <button class="btn-pri" onclick="$m('mo-add').classList.add('show')" data-i18n="add-btn">+ Create Link</button>
+    </div>
+    <div id="links-container"></div>
+  </div>
+
+  <div class="main-section">
+    <div class="sec-head">
+      <div class="sec-title" data-i18n="addr-title">Custom Routing / SNI Addresses</div>
+      <button class="btn-pri" onclick="$m('mo-addr').classList.add('show')" data-i18n="addr-add">+ Add Address</button>
+    </div>
+    <div id="addr-container" style="display:flex; flex-wrap:wrap; gap:8px;"></div>
+  </div>
+</div>
+
+<div class="modal" id="mo-add">
+  <div class="modal-content">
+    <h3 style="font-family:'Sora'; margin-bottom:16px;" data-i18n="mo-add-t">Create New Access Inbound</h3>
+    <div class="form-group">
+      <label data-i18n="mo-lbl-name">Inbound Name / Remark</label>
+      <input type="text" id="mo-in-label" placeholder="e.g. John-Remote">
+    </div>
+    <div class="form-group" style="display:grid; grid-template-columns: 2fr 1fr; gap:8px;">
+      <div>
+        <label data-i18n="mo-lbl-quota">Data Quota</label>
+        <input type="number" id="mo-in-quota" value="0">
+      </div>
+      <div>
+        <label>&nbsp;</label>
+        <select id="mo-in-unit"><option>GB</option><option>MB</option></select>
+      </div>
+    </div>
+    <div class="form-group">
+      <label data-i18n="mo-lbl-conn">Max Concurrent Connections (0 = Unlim)</label>
+      <input type="number" id="mo-in-conn" value="0">
+    </div>
+    <div class="form-group">
+      <label data-i18n="mo-lbl-days">Validity Period (Days, optional)</label>
+      <input type="number" id="mo-in-days" placeholder="Unlimited">
+    </div>
+    <div class="link-actions" style="justify-content:flex-end; margin-top:20px;">
+      <button class="btn-sec" onclick="$m('mo-add').classList.remove('show')" data-i18n="cancel">Cancel</button>
+      <button class="btn-pri" onclick="saveLink()" data-i18n="save">Save</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="mo-addr">
+  <div class="modal-content">
+    <h3 style="font-family:'Sora'; margin-bottom:16px;" data-i18n="mo-addr-t">Add Custom Routing Address</h3>
+    <div class="form-group">
+      <label data-i18n="mo-addr-lbl">Domain / Host Address</label>
+      <input type="text" id="mo-in-addr" placeholder="e.g. speedtest.net">
+    </div>
+    <div class="link-actions" style="justify-content:flex-end; margin-top:20px;">
+      <button class="btn-sec" onclick="$m('mo-addr').classList.remove('show')" data-i18n="cancel">Cancel</button>
+      <button class="btn-pri" onclick="saveAddr()" data-i18n="add-btn">Add</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="ts">Action Successful</div>
+
+<script>
+const I18N = {
+  en: {
+    logout: "Logout", "st-conn": "Active Connections", "st-traffic": "Total Traffic",
+    "st-cpu": "CPU Load", "st-mem": "Memory Usage", "links-title": "Client Inbounds & Metrics",
+    "add-btn": "Create Link", "addr-title": "Custom Routing / SNI Addresses", "addr-add": "Add Address",
+    "mo-add-t": "Create New Access Inbound", "mo-lbl-name": "Inbound Name / Remark", "mo-lbl-quota": "Data Quota",
+    "mo-lbl-conn": "Max Concurrent Connections", "mo-lbl-days": "Validity Period (Days)", "cancel": "Cancel", "save": "Save",
+    "mo-addr-t": "Add Custom Routing Address", "mo-addr-lbl": "Domain / Host Address"
+  },
+  fa: {
+    logout: "خروج", "st-conn": "اتصالات فعال", "st-traffic": "ترافیک کل",
+    "st-cpu": "بار پردازنده", "st-mem": "مصرف حافظه", "links-title": "تنظیمات کلاینت و ترافیک",
+    "add-btn": "ایجاد لینک", "addr-title": "آدرس‌های مسیریابی اختصاصی (SNI)", "addr-add": "افزودن آدرس",
+    "mo-add-t": "ایجاد اتصال ورودی جدید", "mo-lbl-name": "نام / عنوان لینک", "mo-lbl-quota": "حجم مجاز ترافیک",
+    "mo-lbl-conn": "حداکثر اتصالات همزمان", "mo-lbl-days": "مدت اعتبار (روز)", "cancel": "لغو", "save": "ذخیره",
+    "mo-addr-t": "افزودن آدرس مسیریابی سفارشی", "mo-addr-lbl": "دامنه / آدرس هاست"
+  }
+};
+
+let theme = localStorage.getItem('theme') || 'dark';
+let lang = localStorage.getItem('lang') || 'en';
+let isAuthenticated = false;
+
+const $m = id => document.getElementById(id);
+
+function setTheme(t) {
+  theme = t; document.documentElement.setAttribute('data-theme', t); localStorage.setItem('theme', t);
+}
+function toggleTheme() { setTheme(theme === 'dark' ? 'light' : 'dark'); }
+
+function setLang(l) {
+  lang = l; document.documentElement.setAttribute('data-lang', l); localStorage.setItem('lang', l);
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    const k = el.getAttribute('data-i18n'); if(I18N[l][k]) el.textContent = I18N[l][k];
+  });
+}
+function toggleLang() { setLang(lang === 'en' ? 'fa' : 'en'); }
+
+function toast(msg, isErr=false) {
+  const t = $m('ts'); t.textContent = msg; t.className = 'toast' + (isErr?' err':'');
+  t.style.display='block'; setTimeout(()=>t.style.display='none',3000);
+}
+
+async function checkAuth() {
+  try {
+    const r = await fetch('/api/me'); const d = await r.json();
+    if(d.authenticated) {
+      isAuthenticated = true; $m('login-screen').style.display='none'; loadStats(); loadLinks(); loadAddrs();
+    }
+  } catch(e){}
+}
+
+async function doLogin() {
+  const pw = $m('login-password').value;
+  try {
+    const r = await fetch('/api/login', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({password:pw})});
+    if(r.ok) {
+      isAuthenticated = true; $m('login-screen').style.display='none'; toast('Authenticated'); loadStats(); loadLinks(); loadAddrs();
+    } else { toast('Invalid Password', true); }
+  } catch(e){ toast('Connection error', true); }
+}
+
+async function doLogout() {
+  await fetch('/api/logout', {method:'POST'}); location.reload();
+}
+
+async function loadStats() {
+  if(!isAuthenticated) return;
+  try {
+    const r = await fetch('/stats'); const d = await r.json();
+    $m('st-conn-v').textContent = d.active_connections;
+    $m('st-traffic-v').textContent = d.total_traffic_mb + ' MB';
+    $m('st-cpu-v').textContent = d.cpu_percent + '%';
+    $m('st-mem-v').textContent = d.memory_percent + '%';
+  } catch(e){}
+}
+
+async function loadLinks() {
+  if(!isAuthenticated) return;
+  try {
+    const r = await fetch('/api/links'); const d = await r.json();
+    const container = $m('links-container'); container.innerHTML = '';
+    d.links.forEach(l => {
+      const row = document.createElement('div'); row.className = 'link-row';
+      const useMb = (l.used_bytes / (1024*1024)).toFixed(1);
+      const limMb = l.limit_bytes ? (l.limit_bytes / (1024*1024)).toFixed(0) + ' MB' : '∞';
+      row.innerHTML = `<div class="link-meta">
+        <h4>${l.label}</h4>
+        <p>Traffic: ${useMb} / ${limMb} | Conns: ${l.current_connections}/${l.max_connections||'∞'}</p>
+      </div>
+      <div class="link-actions">
+        <button class="btn-sec" onclick="navigator.clipboard.writeText('${l.vless_link}'); toast('Config Copied');">Copy</button>
+        <button class="btn-sec" style="color:var(--danger);" onclick="delLink('${l.uuid}')">Delete</button>
+      </div>`;
+      container.appendChild(row);
+    });
+  } catch(e){}
+}
+
+async function loadAddrs() {
+  if(!isAuthenticated) return;
+  try {
+    const r = await fetch('/api/addresses'); const d = await r.json();
+    const container = $m('addr-container'); container.innerHTML = '';
+    d.addresses.forEach(a => {
+      const badge = document.createElement('span');
+      badge.style = "background:var(--bg-input); padding:6px 12px; border-radius:20px; font-size:12px; display:inline-flex; align-items:center; gap:8px; border:1px solid var(--border);";
+      badge.innerHTML = `${a} <b style="cursor:pointer; color:var(--danger);" onclick="delAddr('${a}')">×</b>`;
+      container.appendChild(badge);
+    });
+  } catch(e){}
+}
+
+async function saveLink() {
+  const lbl = $m('mo-in-label').value;
+  const qVal = $m('mo-in-quota').value;
+  const qUnit = $m('mo-in-unit').value;
+  const conn = $m('mo-in-conn').value;
+  const days = $m('mo-in-days').value;
+  try {
+    const r = await fetch('/api/links', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({label:lbl, limit_value:qVal, limit_unit:qUnit, max_connections:conn, days_valid:days})
+    });
+    if(!r.ok) { const err = await r.json(); throw new Error(err.detail || 'Failed'); }
+    toast('Inbound Created'); $m('mo-add').classList.remove('show'); loadLinks();
+  } catch(e){ toast(e.message, true); }
+}
+
+async function delLink(uid) {
+  if(!confirm('Delete Inbound?')) return;
+  await fetch('/api/links/'+uid, {method:'DELETE'}); toast('Inbound Deleted'); loadLinks();
+}
+
+async function saveAddr() {
+  const addr = $m('mo-in-addr').value;
+  await fetch('/api/addresses', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({address:addr})});
+  toast('Address Added'); $m('mo-addr').classList.remove('show'); loadAddrs();
+}
+
+async function delAddr(addr) {
+  await fetch('/api/addresses/'+addr, {method:'DELETE'}); toast('Address Removed'); loadAddrs();
+}
+
+setTheme(theme); setLang(lang); checkAuth();
+setInterval(()=>{ if(isAuthenticated){ loadStats(); loadLinks(); } }, 10000);
+</script>
+</body>
+</html>"""
 
 @app.get("/login", response_class=HTMLResponse)
-async def login_page():
+async def login_page(request: Request):
     return HTMLResponse(content=PANEL_HTML)
 
 @app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard_page(_=Depends(require_auth)):
+async def dashboard_page(request: Request):
     return HTMLResponse(content=PANEL_HTML)
 
 if __name__ == "__main__":
