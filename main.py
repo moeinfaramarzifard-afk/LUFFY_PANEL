@@ -1,4 +1,4 @@
-Import asyncio
+import asyncio
 import json
 import os
 import hashlib
@@ -16,6 +16,7 @@ import uvicorn
 import httpx
 import logging
 import psutil
+import sqlite3
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("Luffy-Gateway")
@@ -25,6 +26,9 @@ app = FastAPI(title="Luffy Panel", docs_url=None, redoc_url=None)
 CONFIG = {
     "port": int(os.environ.get("PORT", 8000)),
     "secret": os.environ.get("SECRET_KEY", secrets.token_urlsafe(32)),
+    "db_path": os.environ.get("DB_PATH", "luffy.db"),
+    "tg_token": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+    "tg_chat_id": os.environ.get("TELEGRAM_CHAT_ID", ""),
 }
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -34,6 +38,7 @@ connections: dict = {}
 connections_lock = asyncio.Lock()          # FIX: lock برای connections
 connection_sockets: dict = {}
 link_ip_map: dict = defaultdict(set)
+SHARE_TOKENS: dict = {}   # token -> {uid, created_at, expires_at, used}
 stats = {"total_bytes": 0, "total_requests": 0, "total_errors": 0, "start_time": time.time()}
 error_logs: deque = deque(maxlen=50)
 hourly_traffic: dict = defaultdict(int)
@@ -48,6 +53,140 @@ CUSTOM_ADDRESSES_LOCK = asyncio.Lock()
 SESSION_COOKIE = "ren_session"
 SESSION_TTL = 60 * 60 * 24 * 7
 UNLIMITED_QUOTA_BYTES = 53687091200000
+
+# ── Persistence (SQLite) ───────────────────────────────────────────────────────
+DB_LOCK = asyncio.Lock()
+
+def _db_conn():
+    conn = sqlite3.connect(CONFIG["db_path"])
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+def db_init():
+    conn = _db_conn()
+    conn.execute("""CREATE TABLE IF NOT EXISTS links (
+        uid TEXT PRIMARY KEY, label TEXT, limit_bytes INTEGER, used_bytes INTEGER,
+        max_connections INTEGER, created_at TEXT, active INTEGER, expires_at TEXT,
+        notified_expiry INTEGER DEFAULT 0, notified_quota INTEGER DEFAULT 0
+    )""")
+    conn.execute("CREATE TABLE IF NOT EXISTS addresses (address TEXT PRIMARY KEY)")
+    conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+    conn.commit()
+    conn.close()
+
+def db_load_all():
+    conn = _db_conn()
+    conn.row_factory = sqlite3.Row
+    links = {}
+    for row in conn.execute("SELECT * FROM links"):
+        links[row["uid"]] = {
+            "label": row["label"], "limit_bytes": row["limit_bytes"], "used_bytes": row["used_bytes"],
+            "max_connections": row["max_connections"], "created_at": row["created_at"],
+            "active": bool(row["active"]), "expires_at": row["expires_at"],
+            "notified_expiry": bool(row["notified_expiry"]), "notified_quota": bool(row["notified_quota"]),
+        }
+    addresses = [r["address"] for r in conn.execute("SELECT address FROM addresses")]
+    settings = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings")}
+    conn.close()
+    return links, addresses, settings
+
+async def db_save_link(uid: str, link: dict):
+    async with DB_LOCK:
+        conn = _db_conn()
+        conn.execute(
+            """INSERT INTO links (uid,label,limit_bytes,used_bytes,max_connections,created_at,active,expires_at,notified_expiry,notified_quota)
+               VALUES (?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(uid) DO UPDATE SET label=excluded.label, limit_bytes=excluded.limit_bytes,
+               used_bytes=excluded.used_bytes, max_connections=excluded.max_connections,
+               active=excluded.active, expires_at=excluded.expires_at,
+               notified_expiry=excluded.notified_expiry, notified_quota=excluded.notified_quota""",
+            (uid, link["label"], link["limit_bytes"], link["used_bytes"], link.get("max_connections", 0),
+             link["created_at"], int(link["active"]), link.get("expires_at"),
+             int(link.get("notified_expiry", False)), int(link.get("notified_quota", False)))
+        )
+        conn.commit()
+        conn.close()
+
+async def db_delete_link(uid: str):
+    async with DB_LOCK:
+        conn = _db_conn()
+        conn.execute("DELETE FROM links WHERE uid=?", (uid,))
+        conn.commit()
+        conn.close()
+
+async def db_save_address(address: str):
+    async with DB_LOCK:
+        conn = _db_conn()
+        conn.execute("INSERT OR IGNORE INTO addresses (address) VALUES (?)", (address,))
+        conn.commit()
+        conn.close()
+
+async def db_delete_address(address: str):
+    async with DB_LOCK:
+        conn = _db_conn()
+        conn.execute("DELETE FROM addresses WHERE address=?", (address,))
+        conn.commit()
+        conn.close()
+
+async def db_save_setting(key: str, value: str):
+    async with DB_LOCK:
+        conn = _db_conn()
+        conn.execute("INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+        conn.commit()
+        conn.close()
+
+async def flush_usage_to_db():
+    """Periodically persist in-memory traffic counters so restarts don't lose usage data."""
+    while True:
+        await asyncio.sleep(30)
+        try:
+            async with LINKS_LOCK:
+                snapshot = {uid: dict(data) for uid, data in LINKS.items()}
+            for uid, data in snapshot.items():
+                await db_save_link(uid, data)
+        except Exception:
+            logger.exception("usage flush failed")
+
+# ── Telegram notifications ─────────────────────────────────────────────────────
+async def telegram_notify(text: str):
+    token, chat_id = CONFIG["tg_token"], CONFIG["tg_chat_id"]
+    if not token or not chat_id:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+            )
+    except Exception:
+        pass
+
+async def quota_expiry_watcher():
+    """Checks every 5 minutes for links nearing quota/expiry and sends a one-time Telegram alert."""
+    while True:
+        await asyncio.sleep(300)
+        try:
+            async with LINKS_LOCK:
+                items = list(LINKS.items())
+            for uid, link in items:
+                changed = False
+                if link["limit_bytes"] > 0:
+                    pct = link["used_bytes"] / link["limit_bytes"] * 100
+                    if pct >= 90 and not link.get("notified_quota"):
+                        await telegram_notify(f"⚠️ <b>{link['label']}</b> reached {pct:.0f}% of its data quota.")
+                        link["notified_quota"] = True
+                        changed = True
+                exp = parse_expires_at(link.get("expires_at"))
+                if exp is not None:
+                    remaining = (exp - datetime.now(timezone.utc)).total_seconds()
+                    if 0 < remaining <= 86400 and not link.get("notified_expiry"):
+                        await telegram_notify(f"⏳ <b>{link['label']}</b> expires in less than 24 hours.")
+                        link["notified_expiry"] = True
+                        changed = True
+                if changed:
+                    await db_save_link(uid, link)
+        except Exception:
+            logger.exception("quota/expiry watcher failed")
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 def hash_password(pw: str) -> str:
@@ -102,7 +241,24 @@ async def startup():
     limits = httpx.Limits(max_connections=500, max_keepalive_connections=100)
     timeout = httpx.Timeout(30.0, connect=10.0)
     http_client = httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=True)
+
+    db_init()
+    saved_links, saved_addresses, saved_settings = db_load_all()
+    if saved_links:
+        async with LINKS_LOCK:
+            LINKS.update(saved_links)
+    if saved_addresses:
+        async with CUSTOM_ADDRESSES_LOCK:
+            CUSTOM_ADDRESSES.clear()
+            CUSTOM_ADDRESSES.extend(saved_addresses)
+    if "password_hash" in saved_settings:
+        AUTH["password_hash"] = saved_settings["password_hash"]
+    elif os.environ.get("ADMIN_PASSWORD"):
+        await db_save_setting("password_hash", AUTH["password_hash"])
+
     asyncio.create_task(keep_alive())
+    asyncio.create_task(flush_usage_to_db())
+    asyncio.create_task(quota_expiry_watcher())
     await ensure_default_link()
 
 @app.on_event("shutdown")
@@ -169,6 +325,7 @@ def seconds_until_expiry(expires_at_str: str | None) -> int | None:
     return max(0, int(remaining))
 
 async def ensure_default_link():
+    created = False
     async with LINKS_LOCK:
         if not LINKS:
             LINKS["Default"] = {
@@ -180,6 +337,9 @@ async def ensure_default_link():
                 "active": True,
                 "expires_at": None,
             }
+            created = True
+    if created:
+        await db_save_link("Default", LINKS["Default"])
 
 def get_client_ip(websocket: WebSocket) -> str:
     forwarded = websocket.headers.get("x-forwarded-for")
@@ -262,6 +422,7 @@ async def api_change_password(request: Request, _=Depends(require_auth)):
     if len(new) < 4:
         raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
     AUTH["password_hash"] = hash_password(new)
+    await db_save_setting("password_hash", AUTH["password_hash"])
     current_token = request.cookies.get(SESSION_COOKIE)
     async with SESSIONS_LOCK:
         SESSIONS.clear()
@@ -325,11 +486,58 @@ async def create_link(request: Request, _=Depends(require_auth)):
             "active": True,
             "expires_at": expires_at,
         }
+    await db_save_link(uid, LINKS[uid])
     return {
         "uuid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
         "max_connections": max_conn, "active": True, "created_at": LINKS[uid]["created_at"],
         "expires_at": expires_at, "vless_link": generate_vless_link(uid, remark=f"Luffy-{label}"),
     }
+
+@app.post("/api/links/bulk")
+async def create_links_bulk(request: Request, _=Depends(require_auth)):
+    """Create multiple inbounds at once, e.g. {"prefix": "User", "count": 10, "limit_value": 10,
+    "limit_unit": "GB", "max_connections": 2, "days_valid": 30}"""
+    body = await request.json()
+    prefix = (body.get("prefix") or "User").strip()[:40]
+    if not re.match(r'^[a-zA-Z0-9\-_. ]+$', prefix):
+        raise HTTPException(status_code=400, detail="Prefix must contain only English letters, numbers, and characters: - _ . space")
+    count = int(body.get("count") or 0)
+    if count <= 0 or count > 200:
+        raise HTTPException(status_code=400, detail="Count must be between 1 and 200")
+    limit_value = float(body.get("limit_value") or 0)
+    limit_unit = body.get("limit_unit") or "GB"
+    limit_bytes = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
+    max_conn = int(body.get("max_connections") or 0)
+    if max_conn < 0:
+        max_conn = 0
+    days_valid = body.get("days_valid")
+    expires_at: str | None = None
+    if days_valid is not None:
+        try:
+            days_valid = int(days_valid)
+            if days_valid > 0:
+                expires_at = (datetime.now(timezone.utc) + timedelta(days=days_valid)).isoformat()
+        except (ValueError, TypeError):
+            pass
+
+    created = []
+    async with LINKS_LOCK:
+        existing_max = 0
+        for k in LINKS:
+            m = re.match(rf'^{re.escape(prefix)}-(\d+)$', k)
+            if m:
+                existing_max = max(existing_max, int(m.group(1)))
+        for i in range(1, count + 1):
+            uid = f"{prefix}-{existing_max + i}"
+            LINKS[uid] = {
+                "label": uid, "limit_bytes": limit_bytes, "used_bytes": 0,
+                "max_connections": max_conn, "created_at": datetime.now(timezone.utc).isoformat(),
+                "active": True, "expires_at": expires_at,
+            }
+            created.append(uid)
+    for uid in created:
+        await db_save_link(uid, LINKS[uid])
+    return {"ok": True, "created": created, "count": len(created)}
 
 @app.get("/api/links")
 async def list_links(_=Depends(require_auth)):
@@ -366,6 +574,7 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
             LINKS[uid]["limit_bytes"] = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
         if "reset_usage" in body and body["reset_usage"]:
             LINKS[uid]["used_bytes"] = 0
+            LINKS[uid]["notified_quota"] = False
         if "label" in body:
             LINKS[uid]["label"] = str(body["label"])[:60]
         if "max_connections" in body:
@@ -376,10 +585,13 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
                 dv = int(body["days_valid"])
                 if dv > 0:
                     LINKS[uid]["expires_at"] = (datetime.now(timezone.utc) + timedelta(days=dv)).isoformat()
+                    LINKS[uid]["notified_expiry"] = False
                 else:
                     LINKS[uid]["expires_at"] = None
             except (ValueError, TypeError):
                 pass
+        link_copy = dict(LINKS[uid])
+    await db_save_link(uid, link_copy)
     return {"ok": True}
 
 @app.delete("/api/links/{uid}")
@@ -387,6 +599,7 @@ async def delete_link(uid: str, _=Depends(require_auth)):
     async with LINKS_LOCK:
         LINKS.pop(uid, None)
     await close_connections_for_link(uid)
+    await db_delete_link(uid)
     return {"ok": True}
 
 @app.get("/api/addresses")
@@ -406,16 +619,80 @@ async def add_address(request: Request, _=Depends(require_auth)):
         if address in CUSTOM_ADDRESSES:
             raise HTTPException(status_code=400, detail="Address already exists")
         CUSTOM_ADDRESSES.append(address)
+    await db_save_address(address)
     return {"ok": True, "addresses": list(CUSTOM_ADDRESSES)}
 
 @app.delete("/api/addresses/{index}")
 async def delete_address(index: int, _=Depends(require_auth)):
     async with CUSTOM_ADDRESSES_LOCK:
         if 0 <= index < len(CUSTOM_ADDRESSES):
-            CUSTOM_ADDRESSES.pop(index)
+            removed = CUSTOM_ADDRESSES.pop(index)
         else:
             raise HTTPException(status_code=404, detail="Address not found")
+    await db_delete_address(removed)
     return {"ok": True, "addresses": list(CUSTOM_ADDRESSES)}
+
+@app.get("/api/backup")
+async def export_backup(_=Depends(require_auth)):
+    """Full JSON export of inbounds + addresses, downloadable for safekeeping."""
+    async with LINKS_LOCK:
+        links_snapshot = {uid: dict(data) for uid, data in LINKS.items()}
+    async with CUSTOM_ADDRESSES_LOCK:
+        addresses_snapshot = list(CUSTOM_ADDRESSES)
+    payload = {
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "links": links_snapshot,
+        "addresses": addresses_snapshot,
+    }
+    headers = {"Content-Disposition": f'attachment; filename="luffy-backup-{int(time.time())}.json"'}
+    return JSONResponse(content=payload, headers=headers)
+
+@app.post("/api/restore")
+async def restore_backup(request: Request, _=Depends(require_auth)):
+    """Restore inbounds + addresses from a previously exported backup JSON. Replaces current data."""
+    body = await request.json()
+    links_in = body.get("links")
+    addresses_in = body.get("addresses")
+    if not isinstance(links_in, dict):
+        raise HTTPException(status_code=400, detail="Invalid backup file: missing 'links'")
+    restored = 0
+    async with LINKS_LOCK:
+        LINKS.clear()
+        for uid, data in links_in.items():
+            try:
+                LINKS[uid] = {
+                    "label": str(data.get("label", uid))[:60],
+                    "limit_bytes": int(data.get("limit_bytes", 0)),
+                    "used_bytes": int(data.get("used_bytes", 0)),
+                    "max_connections": int(data.get("max_connections", 0)),
+                    "created_at": data.get("created_at") or datetime.now(timezone.utc).isoformat(),
+                    "active": bool(data.get("active", True)),
+                    "expires_at": data.get("expires_at"),
+                    "notified_expiry": bool(data.get("notified_expiry", False)),
+                    "notified_quota": bool(data.get("notified_quota", False)),
+                }
+                restored += 1
+            except Exception:
+                continue
+        links_snapshot = {uid: dict(d) for uid, d in LINKS.items()}
+    if isinstance(addresses_in, list):
+        async with CUSTOM_ADDRESSES_LOCK:
+            CUSTOM_ADDRESSES.clear()
+            CUSTOM_ADDRESSES.extend(str(a) for a in addresses_in)
+        async with DB_LOCK:
+            conn = _db_conn()
+            conn.execute("DELETE FROM addresses")
+            conn.executemany("INSERT OR IGNORE INTO addresses (address) VALUES (?)", [(a,) for a in CUSTOM_ADDRESSES])
+            conn.commit()
+            conn.close()
+    async with DB_LOCK:
+        conn = _db_conn()
+        conn.execute("DELETE FROM links")
+        conn.commit()
+        conn.close()
+    for uid, data in links_snapshot.items():
+        await db_save_link(uid, data)
+    return {"ok": True, "restored_links": restored, "restored_addresses": len(CUSTOM_ADDRESSES)}
 
 @app.get("/api/links/{uid}/sub")
 async def get_subscription(uid: str, _=Depends(require_auth)):
@@ -494,6 +771,117 @@ async def subscription_endpoint(uid: str):
         "subscription-userinfo": f"upload={link['used_bytes']}; download=0; total={total_bytes}; expire={expire_ts}",
     }
     return Response(content=encoded, headers=headers)
+
+# ── Minimal standalone public page (shared style with the panel) ──────────────
+def _public_page(title: str, body: str) -> str:
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>{title}</title>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@600;700;800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+:root{{--bg:#0A0A0B;--surface:#19191C;--surface3:#212124;--border:rgba(255,255,255,.08);
+--text:#F2F2F3;--text2:#A0A0A8;--text3:#65656E;--accent:#6366F1;--accent-dim:rgba(99,102,241,.14);
+--green:#22C55E;--green-dim:rgba(34,197,94,.13);--red:#F43F5E;--red-dim:rgba(244,63,94,.13);
+--yellow:#F5A524;}}
+body{{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}}
+.box{{background:var(--surface);border:1px solid var(--border);border-radius:18px;padding:30px;width:100%;max-width:420px;box-shadow:0 10px 30px rgba(0,0,0,.35)}}
+.mono{{width:36px;height:36px;border-radius:11px;background:linear-gradient(155deg,#6366F1,#4338CA);display:flex;align-items:center;justify-content:center;color:#fff;font-family:'Sora',sans-serif;font-weight:800;font-size:16px;margin-bottom:14px}}
+h1{{font-family:'Sora',sans-serif;font-size:18px;font-weight:700;letter-spacing:-.01em;margin-bottom:4px}}
+p{{color:var(--text3);font-size:12.5px;line-height:1.6}}
+.pill-bar{{height:8px;background:var(--surface3);border-radius:4px;overflow:hidden;margin:14px 0 6px}}
+.pill-fill{{height:100%;border-radius:4px}}
+.row{{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border);font-size:12.5px}}
+.row:last-child{{border-bottom:none}}
+.row b{{font-family:'JetBrains Mono',monospace;font-weight:600}}
+.tag{{display:inline-flex;padding:3px 9px;border-radius:6px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}}
+.qr-box{{text-align:center;padding:18px;background:var(--surface3);border-radius:12px;margin-top:16px}}
+.qr-box img{{max-width:200px;border-radius:8px}}
+textarea{{width:100%;margin-top:14px;background:var(--surface3);border:1px solid var(--border);border-radius:10px;color:var(--text2);font-size:10.5px;font-family:'JetBrains Mono',monospace;padding:10px;resize:none}}
+.copybtn{{width:100%;margin-top:10px;background:var(--accent);color:#fff;border:none;border-radius:9px;padding:11px;font-weight:600;font-size:13px;cursor:pointer;font-family:inherit}}
+</style></head><body><div class="box">{body}</div>
+<script>
+function cp(){{const t=document.getElementById('cfgtxt');if(!t)return;navigator.clipboard.writeText(t.value).then(()=>{{const b=document.getElementById('cpbtn');if(b){{b.textContent='Copied ✓';setTimeout(()=>b.textContent='Copy Config',1500);}}}});}}
+</script>
+</body></html>"""
+
+# ── One-time secure share links ────────────────────────────────────────────────
+@app.post("/api/links/{uid}/share")
+async def create_share_link(uid: str, _=Depends(require_auth)):
+    async with LINKS_LOCK:
+        if uid not in LINKS:
+            raise HTTPException(status_code=404, detail="link not found")
+    for tok, info in list(SHARE_TOKENS.items()):
+        if info["expires_at"] < time.time():
+            SHARE_TOKENS.pop(tok, None)
+    token = secrets.token_urlsafe(24)
+    SHARE_TOKENS[token] = {"uid": uid, "created_at": time.time(), "expires_at": time.time() + 86400, "used": False}
+    return {"ok": True, "share_url": f"https://{get_domain()}/share/{token}"}
+
+@app.get("/share/{token}", response_class=HTMLResponse)
+async def view_share_link(token: str):
+    info = SHARE_TOKENS.get(token)
+    if info is None or info["expires_at"] < time.time():
+        return HTMLResponse(_public_page("Link Expired", """
+            <div class="mono">!</div><h1>This link is no longer valid</h1>
+            <p>One-time share links expire after 24 hours or after being opened once. Ask the admin to generate a new one.</p>"""))
+    if info["used"]:
+        return HTMLResponse(_public_page("Already Viewed", """
+            <div class="mono">✓</div><h1>This link was already opened</h1>
+            <p>For security, one-time share links can only be viewed once. Ask the admin to generate a new one if you need the config again.</p>"""))
+    info["used"] = True
+    uid = info["uid"]
+    async with LINKS_LOCK:
+        link = LINKS.get(uid)
+        if link is None:
+            return HTMLResponse(_public_page("Not Found", '<div class="mono">!</div><h1>Config not found</h1><p>This inbound no longer exists.</p>'))
+        link = dict(link)
+    vless_link = generate_vless_link(uid, remark=f"Luffy-{link['label']}")
+    body = f"""
+        <div class="mono">L</div>
+        <h1>{link['label']}</h1>
+        <p>Save this config now — this link cannot be opened again.</p>
+        <div class="qr-box"><img src="https://api.qrserver.com/v1/create-qr-code/?size=240x240&data={quote(vless_link)}" alt="QR"></div>
+        <textarea id="cfgtxt" rows="3" readonly>{vless_link}</textarea>
+        <button class="copybtn" id="cpbtn" onclick="cp()">Copy Config</button>
+    """
+    return HTMLResponse(_public_page(f"{link['label']} · Config", body))
+
+# ── Public client self-status page ─────────────────────────────────────────────
+@app.get("/status/{uid}", response_class=HTMLResponse)
+async def client_status_page(uid: str):
+    async with LINKS_LOCK:
+        link = LINKS.get(uid)
+        if link is None:
+            return HTMLResponse(_public_page("Not Found", '<div class="mono">!</div><h1>Not found</h1><p>No such config exists.</p>'), status_code=404)
+        link = dict(link)
+    used, limit = link["used_bytes"], link["limit_bytes"]
+    pct = min(100, round((used / limit) * 100, 1)) if limit > 0 else 0
+    color = "var(--red)" if pct > 90 else ("var(--yellow)" if pct > 70 else "var(--accent)")
+    used_str = _fmt_bytes(used)
+    limit_str = "Unlimited" if limit == 0 else _fmt_bytes(limit)
+    secs_left = seconds_until_expiry(link.get("expires_at"))
+    if secs_left is None:
+        expiry_str = "Never"
+    elif secs_left == 0:
+        expiry_str = "Expired"
+    else:
+        expiry_str = f"{secs_left // 86400}d {(secs_left % 86400) // 3600}h left"
+    active = link["active"] and secs_left != 0
+    status_tag = f'<span class="tag" style="background:var(--green-dim);color:var(--green)">Active</span>' if active else f'<span class="tag" style="background:var(--red-dim);color:var(--red)">Inactive</span>'
+    bar = "" if limit == 0 else f'<div class="pill-bar"><div class="pill-fill" style="width:{pct}%;background:{color}"></div></div>'
+    body = f"""
+        <div class="mono">L</div>
+        <h1>{link['label']}</h1>
+        <p>Your personal usage status. This page only shows your own connection — nothing else.</p>
+        <div class="row"><span>Status</span>{status_tag}</div>
+        <div class="row"><span>Data used</span><b>{used_str} / {limit_str}</b></div>
+        {bar}
+        <div class="row"><span>Expires</span><b>{expiry_str}</b></div>
+        <div class="row"><span>Max devices</span><b>{link.get('max_connections') or '∞'}</b></div>
+    """
+    return HTMLResponse(_public_page(f"{link['label']} · Status", body))
 
 # ── WebSocket tunnel ──────────────────────────────────────────────────────────
 RELAY_BUF = 64 * 1024
@@ -738,201 +1126,195 @@ PANEL_HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title data-en="Luffy Panel" data-fa="LUFFY PANEL">Luffy Panel</title>
-<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@700;900&family=Inter:wght@300;400;500;600;700&family=Vazirmatn:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700;800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700&family=Vazirmatn:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
-  --gold:#FFD700;--gold2:#FFC200;--gold3:#C8900A;--gold-dim:rgba(255,215,0,0.12);
-  --black:#060608;--black2:#0c0c10;--black3:#111118;
-  --surface:rgba(12,12,18,0.97);--surface2:rgba(20,20,28,0.9);--surface3:rgba(28,28,40,0.8);
-  --border:rgba(255,215,0,0.1);--border2:rgba(255,215,0,0.2);
-  --text:rgba(255,255,255,0.92);--text2:rgba(255,215,0,0.7);--text3:rgba(255,255,255,0.4);
-  --white-neon:rgba(255,255,255,0.85);--white-glow:0 0 16px rgba(255,255,255,0.25);
-  --gold-glow:0 0 20px rgba(255,215,0,0.4);
-  --green:#4ade80;--green-dim:rgba(74,222,128,0.1);
-  --red:#f87171;--red-dim:rgba(248,113,113,0.1);
-  --yellow:#fbbf24;
-  --nav-w:64px;
+  --bg:#0A0A0B;--surface:#121214;--surface2:#19191C;--surface3:#212124;
+  --border:rgba(255,255,255,.08);--border2:rgba(255,255,255,.16);
+  --text:#F2F2F3;--text2:#A0A0A8;--text3:#65656E;
+  --accent:#6366F1;--accent-dim:rgba(99,102,241,.14);--accent-hover:#818CF8;--accent-glow:0 0 0 3px rgba(99,102,241,.16);
+  --green:#22C55E;--green-dim:rgba(34,197,94,.13);
+  --red:#F43F5E;--red-dim:rgba(244,63,94,.13);
+  --yellow:#F5A524;--yellow-dim:rgba(245,165,36,.13);
+  --purple:#A78BFA;--purple-dim:rgba(167,139,250,.13);
+  --shadow-sm:0 1px 2px rgba(0,0,0,.4);--shadow-md:0 8px 24px rgba(0,0,0,.35);
+  --nav-h:64px;--radius:12px;--radius-lg:16px;
 }
-body.light-mode {
-  --black: #f0f2f5; --black2: #ffffff; --black3: #e4e6eb;
-  --surface: rgba(255,255,255,0.95); --surface2: #ffffff; --surface3: #f9fafb;
-  --border: rgba(0,0,0,0.1); --border2: rgba(0,0,0,0.2);
-  --text: #111827; --text2: #4b5563; --text3: #6b7280;
-  --gold-dim: rgba(218, 165, 32, 0.15);
-  --gold-glow: 0 4px 14px rgba(0,0,0,0.1);
+body.light-mode{
+  --bg:#FAFAFA;--surface:#FFFFFF;--surface2:#FFFFFF;--surface3:#F4F4F6;
+  --border:rgba(15,15,20,.08);--border2:rgba(15,15,20,.14);
+  --text:#16171B;--text2:#55565F;--text3:#9596A0;
+  --accent:#4F46E5;--accent-dim:rgba(79,70,229,.08);--accent-hover:#6366F1;--accent-glow:0 0 0 3px rgba(79,70,229,.1);
+  --shadow-sm:0 1px 2px rgba(15,15,20,.05);--shadow-md:0 12px 28px rgba(15,15,20,.07);
 }
-html,body{height:100%;background:var(--black);transition: background 0.3s, color 0.3s;}
-body{font-family:'Inter','Vazirmatn',sans-serif;color:var(--text);display:flex;min-height:100vh;}
+html,body{height:100%;background:var(--bg);transition:background .3s,color .3s}
+body{font-family:'Inter','Vazirmatn',sans-serif;color:var(--text);display:flex;flex-direction:column;min-height:100vh}
 body[dir="rtl"]{direction:rtl;text-align:right}
-::-webkit-scrollbar{width:4px}::-webkit-scrollbar-thumb{background:rgba(255,215,0,0.2);border-radius:4px}
-.bg-fixed{position:fixed;inset:0;z-index:0;pointer-events:none;background:radial-gradient(ellipse 70% 50% at 50% -10%,var(--gold-dim),transparent 60%)}
-.grid-fixed{position:fixed;inset:0;z-index:0;pointer-events:none;background-image:linear-gradient(rgba(128,128,128,0.05) 1px,transparent 1px),linear-gradient(90deg,rgba(128,128,128,0.05) 1px,transparent 1px);background-size:56px 56px}
-.sidebar{position:fixed;left:0;top:0;bottom:0;width:var(--nav-w);background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;z-index:100;transition:all .3s cubic-bezier(.4,0,.2,1);backdrop-filter:blur(20px);}
-.sidebar::after{content:'';position:absolute;top:0;right:0;bottom:0;width:1px;background:linear-gradient(180deg,transparent,rgba(255,215,0,0.3) 30%,rgba(255,215,0,0.3) 70%,transparent)}
-.light-mode .sidebar::after{display:none;}
-.sb-brand{padding:16px 0;display:flex;flex-direction:column;align-items:center;gap:2px;border-bottom:1px solid var(--border);flex-shrink:0}
-.sb-hat{filter:drop-shadow(0 0 10px rgba(255,215,0,.6));transition:filter .3s}
-.sb-hat:hover{filter:drop-shadow(0 0 18px rgba(255,215,0,.9))}
-.sb-title{font-family:'Cinzel',serif;font-size:8px;letter-spacing:.18em;color:rgba(255,215,0,.6);text-transform:uppercase;white-space:nowrap;overflow:hidden}
-.sb-nav{flex:1;display:flex;flex-direction:column;justify-content:flex-end;padding-bottom:12px;gap:2px;padding-left:8px;padding-right:8px}
-.nav-item{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;padding:10px 6px;border-radius:12px;color:var(--text3);cursor:pointer;transition:all .2s cubic-bezier(.4,0,.2,1);border:1px solid transparent;position:relative;overflow:hidden;text-decoration:none;background:none;width:100%;font-family:inherit;}
-.nav-item::before{content:'';position:absolute;inset:0;border-radius:12px;background:linear-gradient(135deg,var(--gold-dim),transparent);opacity:0;transition:opacity .2s}
-.nav-item:hover{color:var(--gold);border-color:rgba(255,215,0,.12)}
-.nav-item:hover::before{opacity:1}
-.nav-item.active{color:var(--gold);border-color:rgba(255,215,0,.22);background:var(--gold-dim);box-shadow:0 0 16px rgba(255,215,0,.1),inset 0 1px 0 rgba(255,215,0,.12)}
-.nav-item.active::before{opacity:1}
-.nav-icon{width:18px;height:18px;flex-shrink:0;transition:transform .2s}
-.nav-item:hover .nav-icon,.nav-item.active .nav-icon{transform:scale(1.1)}
-.nav-label{font-size:8.5px;font-weight:600;letter-spacing:.05em;white-space:nowrap;overflow:hidden}
-.nav-badge{position:absolute;top:5px;right:5px;background:var(--gold);color:#000;font-size:8px;font-weight:800;min-width:14px;height:14px;border-radius:7px;display:flex;align-items:center;justify-content:center;padding:0 3px}
-.sb-bottom{padding:8px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:6px;flex-shrink:0}
-.lang-row{display:flex;gap:4px}
-.lang-btn{flex:1;padding:5px 2px;border:1px solid var(--border);border-radius:7px;background:none;color:var(--text3);font-size:9px;font-weight:700;cursor:pointer;transition:all .2s;font-family:inherit;letter-spacing:.05em}
-.lang-btn.active{background:var(--gold-dim);border-color:var(--gold);color:var(--gold)}
-.lang-btn:hover:not(.active){border-color:rgba(255,215,0,.15);color:rgba(255,215,0,.5)}
-.logout-btn{display:flex;align-items:center;justify-content:center;padding:7px;border:1px solid rgba(248,113,113,.15);border-radius:8px;background:rgba(248,113,113,.06);color:rgba(248,113,113,.6);cursor:pointer;transition:all .2s;font-size:10px;gap:4px;font-weight:600;font-family:inherit}
-.logout-btn:hover{background:rgba(248,113,113,.12);border-color:rgba(248,113,113,.3);color:var(--red)}
-.theme-toggle{background:transparent;border:1px solid var(--border);color:var(--text3);border-radius:7px;padding:4px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all 0.2s;}
-.theme-toggle:hover{background:var(--surface3);color:var(--gold);border-color:var(--gold);}
-.main{margin-left:var(--nav-w);flex:1;padding:24px 28px 48px;min-height:100vh;position:relative;z-index:1}
-.page{display:none;animation:pgIn .35s ease}
+::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-thumb{background:var(--border2);border-radius:4px}
+.bg-fixed{position:fixed;inset:0;z-index:0;pointer-events:none;background:radial-gradient(ellipse 60% 40% at 50% -5%,var(--accent-dim),transparent 65%)}
+.grid-fixed{display:none}
+
+/* Top navigation */
+.sidebar{position:fixed;top:0;left:0;right:0;height:var(--nav-h);background:color-mix(in srgb,var(--surface) 88%,transparent);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:6px;padding:0 22px;z-index:100;backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px)}
+.sb-brand{display:flex;align-items:center;gap:10px;margin-right:8px;flex-shrink:0}
+.sb-hat{width:30px;height:30px;border-radius:9px;background:linear-gradient(155deg,var(--accent),#4338CA);display:flex;align-items:center;justify-content:center;color:#fff;font-family:'Sora',sans-serif;font-weight:800;font-size:14px;box-shadow:0 3px 10px rgba(99,102,241,.35);flex-shrink:0}
+.sb-title{font-family:'Sora',sans-serif;font-size:14px;font-weight:700;color:var(--text);letter-spacing:-.01em;white-space:nowrap}
+.sb-nav{flex:1;display:flex;flex-direction:row;align-items:center;gap:2px;height:100%}
+.nav-item{display:flex;flex-direction:row;align-items:center;justify-content:center;gap:7px;padding:0 14px;height:38px;margin-top:1px;border-radius:9px;color:var(--text3);cursor:pointer;transition:all .18s ease;border:none;position:relative;text-decoration:none;background:none;font-family:'Inter',inherit}
+.nav-item:hover{color:var(--text);background:var(--surface3)}
+.nav-item.active{color:var(--accent);background:var(--accent-dim)}
+.nav-icon{width:16px;height:16px;flex-shrink:0}
+.nav-label{font-size:12.5px;font-weight:600;white-space:nowrap}
+.nav-badge{background:var(--accent);color:#fff;font-size:10px;font-weight:700;min-width:16px;height:16px;border-radius:8px;display:flex;align-items:center;justify-content:center;padding:0 4px;margin-left:1px}
+.nav-item.active .nav-badge{background:var(--accent)}
+.sb-bottom{display:flex;align-items:center;gap:8px;flex-shrink:0}
+.lang-row{display:flex;gap:2px;background:var(--surface3);border:1px solid var(--border);border-radius:8px;padding:2px}
+.lang-btn{padding:5px 9px;border:none;border-radius:6px;background:none;color:var(--text3);font-size:10.5px;font-weight:700;cursor:pointer;transition:all .15s;font-family:inherit;letter-spacing:.02em}
+.lang-btn.active{background:var(--surface);color:var(--text);box-shadow:var(--shadow-sm)}
+.lang-btn:hover:not(.active){color:var(--text2)}
+.logout-btn{display:flex;align-items:center;justify-content:center;gap:5px;padding:7px 11px;border:1px solid var(--border);border-radius:8px;background:var(--surface3);color:var(--text2);cursor:pointer;transition:all .15s;font-size:11.5px;font-weight:600;font-family:inherit}
+.logout-btn:hover{background:var(--red-dim);border-color:rgba(244,63,94,.25);color:var(--red)}
+.theme-toggle{background:var(--surface3);border:1px solid var(--border);color:var(--text2);border-radius:8px;width:32px;height:32px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .15s;font-size:14px}
+.theme-toggle:hover{color:var(--accent);border-color:var(--accent)}
+
+.main{margin-top:var(--nav-h);flex:1;width:100%;max-width:1180px;margin-left:auto;margin-right:auto;padding:28px 28px 60px;position:relative;z-index:1}
+.page{display:none;animation:pgIn .3s ease}
 .page.active{display:block}
-@keyframes pgIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
-.page-header{margin-bottom:20px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}
-.page-title{font-family:'Cinzel',serif;font-size:16px;font-weight:700;color:var(--text);letter-spacing:.04em}
-.page-sub{font-size:11px;color:var(--text3);margin-top:3px;letter-spacing:.02em}
-.stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}
-.stat-card{background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:16px;position:relative;overflow:hidden;transition:all .25s;animation:cIn .5s ease both}
-.stat-card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(255,215,0,0.4),transparent)}
-.light-mode .stat-card::before{display:none;}
-.stat-card:hover{border-color:var(--border2);transform:translateY(-2px);box-shadow:var(--gold-glow)}
-@keyframes cIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
-.stat-label{font-size:9.5px;color:var(--text3);font-weight:700;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px}
-.stat-val{font-size:20px;font-weight:700;color:var(--text);letter-spacing:-.02em}
-.stat-unit{font-size:11px;font-weight:400;color:var(--text3)}
-.card{background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:10px;position:relative;overflow:hidden;transition:all .25s;animation:cIn .5s ease both}
-.card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(255,215,0,0.25),transparent)}
-.light-mode .card::before{display:none;}
-.card-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
-.card-title{font-size:12px;font-weight:600;color:var(--text);display:flex;align-items:center;gap:6px}
+@keyframes pgIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+.page-header{margin-bottom:22px;display:flex;align-items:flex-end;justify-content:space-between;flex-wrap:wrap;gap:10px}
+.page-title{font-family:'Sora',sans-serif;font-size:21px;font-weight:700;color:var(--text);letter-spacing:-.02em}
+.page-sub{font-size:12.5px;color:var(--text3);margin-top:4px}
+
+.stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:14px}
+.stat-card{background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-lg);padding:18px;position:relative;overflow:hidden;transition:all .2s;animation:cIn .4s ease both;box-shadow:var(--shadow-sm)}
+.stat-card:hover{border-color:var(--border2);transform:translateY(-2px);box-shadow:var(--shadow-md)}
+@keyframes cIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+.stat-label{font-size:10.5px;color:var(--text3);font-weight:600;text-transform:uppercase;letter-spacing:.07em;margin-bottom:10px}
+.stat-val{font-family:'JetBrains Mono',monospace;font-size:21px;font-weight:600;color:var(--text);letter-spacing:-.02em}
+.stat-unit{font-size:11.5px;font-weight:500;color:var(--text3);font-family:'Inter',sans-serif}
+.card{background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-lg);padding:18px;margin-bottom:12px;position:relative;overflow:hidden;transition:all .2s;animation:cIn .4s ease both;box-shadow:var(--shadow-sm)}
+.card-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+.card-title{font-family:'Sora',sans-serif;font-size:13.5px;font-weight:600;color:var(--text);display:flex;align-items:center;gap:7px;letter-spacing:-.01em}
 .chart-container{height:170px;width:100%}
-.btn{font-family:inherit;font-size:11.5px;font-weight:700;border-radius:8px;padding:7px 14px;cursor:pointer;display:inline-flex;align-items:center;gap:5px;border:none;transition:all .2s;letter-spacing:.03em}
-.btn-gold{background:linear-gradient(135deg,#FFD700,#C8900A);color:#000;box-shadow:0 0 16px rgba(255,215,0,.25)}
-.btn-gold:hover{filter:brightness(1.1);transform:translateY(-1px);box-shadow:0 0 24px rgba(255,215,0,.4)}
-.btn-ghost{background:var(--surface3);color:var(--text);border:1px solid var(--border)}
-.btn-danger{background:var(--red-dim);color:var(--red);border:1px solid rgba(248,113,113,.15)}
-.btn-sm{padding:4px 9px;font-size:10.5px}
-.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.tbl-wrap{overflow-x:auto}
+
+.btn{font-family:inherit;font-size:12px;font-weight:600;border-radius:9px;padding:8px 15px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;border:1px solid transparent;transition:all .15s}
+.btn-gold{background:var(--accent);color:#fff;box-shadow:0 2px 8px rgba(99,102,241,.3)}
+.btn-gold:hover{background:var(--accent-hover);transform:translateY(-1px);box-shadow:0 4px 14px rgba(99,102,241,.4)}
+.btn-ghost{background:var(--surface3);color:var(--text);border-color:var(--border)}
+.btn-ghost:hover{border-color:var(--border2)}
+.btn-danger{background:var(--red-dim);color:var(--red);border-color:rgba(244,63,94,.2)}
+.btn-sm{padding:5px 10px;font-size:11px}
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.tbl-wrap{overflow-x:auto;border-radius:var(--radius);border:1px solid var(--border)}
 .tbl{width:100%;border-collapse:collapse}
-.tbl th{text-align:left;font-size:9.5px;font-weight:700;color:var(--text3);padding:9px 11px;text-transform:uppercase;letter-spacing:.06em;border-bottom:1px solid var(--border);background:var(--surface3)}
-.tbl td{padding:9px 11px;border-bottom:1px solid var(--border);font-size:12.5px;vertical-align:middle}
-.tag{display:inline-flex;align-items:center;padding:2px 7px;border-radius:4px;font-size:9px;font-weight:800;letter-spacing:.05em;text-transform:uppercase}
-.tag-vless{background:var(--gold-dim);color:var(--gold);border:1px solid var(--border)}
-.tag-on{background:var(--green-dim);color:var(--green);border:1px solid rgba(74,222,128,.2)}
-.tag-off{background:var(--red-dim);color:var(--red);border:1px solid rgba(248,113,113,.2)}
-.pill{display:flex;align-items:center;gap:7px;font-size:11px}
-.pill-used{color:var(--text);font-weight:600}
-.pill-bar{flex:1;height:4px;background:var(--border);border-radius:2px;min-width:40px}
-.pill-fill{height:100%;border-radius:2px;transition:width .4s}
-.pill-lim{color:var(--text3);font-size:10px}
-.toggle{width:32px;height:17px;border-radius:9px;background:var(--surface3);position:relative;cursor:pointer;transition:all .28s;border:1px solid var(--border);flex-shrink:0}
-.toggle::after{content:'';position:absolute;width:11px;height:11px;border-radius:50%;background:var(--text3);top:2px;left:2px;transition:all .28s cubic-bezier(.4,0,.2,1)}
-.toggle.on{background:var(--green);border-color:var(--green);box-shadow:0 0 10px rgba(74,222,128,.3)}
-.toggle.on::after{left:17px;background:#fff}
-.sys-bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden}
-.sys-fill{height:100%;border-radius:3px;transition:width .4s}
-.sl-item{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)}
-.sl-k{color:var(--text3);font-size:11.5px}
-.sl-v{color:var(--text);font-weight:600;font-size:11.5px}
-.fg{display:flex;flex-direction:column;gap:4px;margin-bottom:11px}
-.fl{font-size:9.5px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.08em}
-.fi,.fs{padding:8px 12px;border-radius:8px;border:1px solid var(--border);font-family:inherit;font-size:12.5px;outline:none;color:var(--text);background:var(--surface);transition:all .2s}
-.fi:focus,.fs:focus{border-color:var(--gold);box-shadow:0 0 0 3px rgba(255,215,0,.08)}
-.fr{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end}
+.tbl th{text-align:left;font-size:10px;font-weight:700;color:var(--text3);padding:11px 12px;text-transform:uppercase;letter-spacing:.06em;border-bottom:1px solid var(--border);background:var(--surface3)}
+.tbl td{padding:11px 12px;border-bottom:1px solid var(--border);font-size:12.5px;vertical-align:middle}
+.tbl tr:last-child td{border-bottom:none}
+.tbl tr:hover td{background:var(--surface3)}
+.tag{display:inline-flex;align-items:center;padding:3px 8px;border-radius:6px;font-size:9.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase}
+.tag-vless{background:var(--accent-dim);color:var(--accent)}
+.tag-on{background:var(--green-dim);color:var(--green)}
+.tag-off{background:var(--red-dim);color:var(--red)}
+.pill{display:flex;align-items:center;gap:8px;font-size:11px}
+.pill-used{color:var(--text);font-weight:600;font-family:'JetBrains Mono',monospace;font-size:10.5px}
+.pill-bar{flex:1;height:5px;background:var(--surface3);border-radius:3px;min-width:40px;overflow:hidden}
+.pill-fill{height:100%;border-radius:3px;transition:width .4s}
+.pill-lim{color:var(--text3);font-size:10px;font-family:'JetBrains Mono',monospace}
+.toggle{width:34px;height:19px;border-radius:10px;background:var(--surface3);position:relative;cursor:pointer;transition:all .25s;border:1px solid var(--border);flex-shrink:0}
+.toggle::after{content:'';position:absolute;width:13px;height:13px;border-radius:50%;background:var(--text3);top:2px;left:2px;transition:all .25s cubic-bezier(.4,0,.2,1)}
+.toggle.on{background:var(--green);border-color:var(--green)}
+.toggle.on::after{left:18px;background:#fff}
+.sys-bar{height:7px;background:var(--surface3);border-radius:4px;overflow:hidden}
+.sys-fill{height:100%;border-radius:4px;transition:width .4s}
+.sl-item{display:flex;align-items:center;justify-content:space-between;padding:11px 0;border-bottom:1px solid var(--border)}
+.sl-item:last-child{border-bottom:none}
+.sl-k{color:var(--text3);font-size:12px}
+.sl-v{color:var(--text);font-weight:600;font-size:12px;font-family:'JetBrains Mono',monospace}
+.fg{display:flex;flex-direction:column;gap:5px;margin-bottom:12px}
+.fl{font-size:10.5px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:.06em}
+.fi,.fs{padding:9px 12px;border-radius:9px;border:1px solid var(--border);font-family:inherit;font-size:13px;outline:none;color:var(--text);background:var(--surface);transition:all .15s}
+.fi:focus,.fs:focus{border-color:var(--accent);box-shadow:var(--accent-glow)}
+.fr{display:flex;gap:9px;flex-wrap:wrap;align-items:flex-end}
 .fr .fg{margin-bottom:0;flex:1;min-width:90px}
-.act-btn{font-family:inherit;font-size:9.5px;font-weight:700;border-radius:6px;padding:4px 8px;cursor:pointer;display:inline-flex;align-items:center;gap:3px;border:1px solid;transition:all .18s}
-.act-copy{background:var(--gold-dim);color:var(--gold);border-color:var(--border)}
-.act-sub{background:var(--green-dim);color:var(--green);border-color:rgba(74,222,128,.2)}
-.act-qr{background:rgba(167,139,250,.1);color:#a78bfa;border-color:rgba(167,139,250,.2)}
-.act-edit{background:rgba(251,191,36,.08);color:var(--yellow);border-color:rgba(251,191,36,.2)}
-.act-del{background:var(--red-dim);color:var(--red);border-color:rgba(248,113,113,.18)}
-.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(16px);background:var(--surface);color:var(--text);border:1px solid var(--border2);border-radius:10px;padding:12px 20px;font-size:13px;font-weight:600;opacity:0;transition:all .3s;z-index:999;backdrop-filter:blur(24px);box-shadow:var(--gold-glow)}
+.act-btn{font-family:inherit;font-size:10px;font-weight:600;border-radius:7px;padding:5px 9px;cursor:pointer;display:inline-flex;align-items:center;gap:3px;border:1px solid;transition:all .15s}
+.act-copy{background:var(--accent-dim);color:var(--accent);border-color:transparent}
+.act-sub{background:var(--green-dim);color:var(--green);border-color:transparent}
+.act-qr{background:var(--purple-dim);color:var(--purple);border-color:transparent}
+.act-edit{background:var(--yellow-dim);color:var(--yellow);border-color:transparent}
+.act-del{background:var(--red-dim);color:var(--red);border-color:transparent}
+.act-btn:hover{filter:brightness(1.15);transform:translateY(-1px)}
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(16px);background:var(--surface2);color:var(--text);border:1px solid var(--border2);border-radius:10px;padding:12px 20px;font-size:13px;font-weight:500;opacity:0;transition:all .3s;z-index:999;backdrop-filter:blur(20px);box-shadow:var(--shadow-md)}
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
-.mo{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:200;display:none;align-items:center;justify-content:center;backdrop-filter:blur(8px)}
+.toast.err{border-color:rgba(244,63,94,.3)}
+.mo{position:fixed;inset:0;background:rgba(8,8,10,.6);z-index:200;display:none;align-items:center;justify-content:center;backdrop-filter:blur(6px);padding:16px}
 .mo.show{display:flex}
-.mo-box{background:var(--surface2);border:1px solid var(--border2);border-radius:18px;padding:24px;width:100%;max-width:460px;position:relative;box-shadow:var(--gold-glow);transform:scale(.92);opacity:0;transition:all .38s cubic-bezier(.34,1.56,.64,1)}
-.mo.show .mo-box{transform:scale(1);opacity:1}
-.mo-title{font-family:'Cinzel',serif;font-size:14px;font-weight:700;margin-bottom:16px;color:var(--gold);letter-spacing:.06em}
-.mo-close{position:absolute;top:14px;right:14px;background:var(--surface3);border:1px solid var(--border);color:var(--text3);width:30px;height:30px;border-radius:7px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:14px;}
-.qr-box{text-align:center;padding:20px;background:var(--surface3);border-radius:12px;border:1px solid var(--border);margin-top:12px}
-.qr-box img{max-width:200px;border-radius:8px;border:3px solid var(--border);box-shadow:var(--gold-glow)}
-.tb{display:flex;align-items:center;gap:7px;margin-bottom:14px;flex-wrap:wrap}
+.mo-box{background:var(--surface2);border:1px solid var(--border2);border-radius:18px;padding:26px;width:100%;max-width:440px;position:relative;box-shadow:var(--shadow-md);transform:scale(.95) translateY(6px);opacity:0;transition:all .25s cubic-bezier(.16,1,.3,1)}
+.mo.show .mo-box{transform:scale(1) translateY(0);opacity:1}
+.mo-title{font-family:'Sora',sans-serif;font-size:15px;font-weight:700;margin-bottom:18px;color:var(--text);letter-spacing:-.01em}
+.mo-close{position:absolute;top:14px;right:14px;background:var(--surface3);border:1px solid var(--border);color:var(--text3);width:28px;height:28px;border-radius:8px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:13px}
+.mo-close:hover{color:var(--text)}
+.qr-box{text-align:center;padding:20px;background:var(--surface3);border-radius:var(--radius);border:1px solid var(--border);margin-top:12px}
+.qr-box img{max-width:200px;border-radius:9px;border:1px solid var(--border)}
+.tb{display:flex;align-items:center;gap:8px;margin-bottom:16px;flex-wrap:wrap}
 .search-wrap{flex:1;min-width:160px;position:relative}
 .search-wrap svg{position:absolute;left:12px;top:50%;transform:translateY(-50%);color:var(--text3)}
-.search-wrap input{width:100%;padding:9px 12px 9px 34px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;font-family:inherit;outline:none;}
-.filter-chips{display:flex;gap:3px;padding:3px;background:var(--surface2);border:1px solid var(--border);border-radius:8px}
-.chip{padding:7px 12px;border-radius:6px;font-size:11.5px;font-weight:700;color:var(--text3);cursor:pointer;border:none;background:none;transition:all .18s;font-family:inherit}
-.chip.active{background:var(--gold);color:#000}
-.m-cards{display:none;flex-direction:column;gap:12px}
-.m-card{border:1px solid var(--border);border-radius:12px;padding:16px;background:var(--surface2)}
+.search-wrap input{width:100%;padding:9px 12px 9px 34px;background:var(--surface2);border:1px solid var(--border);border-radius:9px;color:var(--text);font-size:13px;font-family:inherit;outline:none}
+.search-wrap input:focus{border-color:var(--accent)}
+.filter-chips{display:flex;gap:2px;padding:3px;background:var(--surface2);border:1px solid var(--border);border-radius:9px}
+.chip{padding:6px 13px;border-radius:7px;font-size:11.5px;font-weight:600;color:var(--text3);cursor:pointer;border:none;background:none;transition:all .15s;font-family:inherit}
+.chip.active{background:var(--accent);color:#fff}
+.m-cards{display:none;flex-direction:column;gap:10px}
+.m-card{border:1px solid var(--border);border-radius:var(--radius-lg);padding:16px;background:var(--surface2);box-shadow:var(--shadow-sm)}
 .m-card-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
 .m-card-acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}
-.empty{text-align:center;padding:36px;color:var(--text3)}
-.mob-hd{display:none;position:fixed;top:0;left:0;right:0;background:var(--surface);border-bottom:1px solid var(--border);z-index:90;align-items:center;justify-content:space-between;backdrop-filter:blur(20px);}
-.mob-tl-group{display:flex;gap:10px;align-items:center;flex-direction:row;}
-.logout-mob{display:none;color:var(--red) !important;}
-.logout-mob:hover{background:var(--red-dim) !important;border-color:rgba(248,113,113,.3) !important;}
+.empty{text-align:center;padding:40px 20px;color:var(--text3);font-size:13px}
+.mob-hd{display:none}
+.mob-tl-group{display:flex;gap:10px;align-items:center}
+.logout-mob{display:none}
+
 /* Login page */
-.login-wrap{display:flex;align-items:center;justify-content:center;min-height:100vh;width:100%}
-.login-box{background:var(--surface2);border:1px solid var(--border2);border-radius:20px;padding:36px 32px;width:100%;max-width:360px;box-shadow:var(--gold-glow)}
-.login-logo{text-align:center;margin-bottom:28px}
-.login-title{font-family:'Cinzel',serif;font-size:22px;font-weight:900;color:var(--gold);letter-spacing:.1em}
-.login-sub{font-size:11px;color:var(--text3);margin-top:6px}
+.login-wrap{display:flex;align-items:center;justify-content:center;min-height:100vh;width:100%;position:relative;z-index:1}
+.login-box{background:var(--surface2);border:1px solid var(--border);border-radius:20px;padding:38px 34px;width:100%;max-width:380px;box-shadow:var(--shadow-md)}
+.login-logo{text-align:center;margin-bottom:30px;display:flex;flex-direction:column;align-items:center}
+.login-title{font-family:'Sora',sans-serif;font-size:19px;font-weight:700;color:var(--text);letter-spacing:-.02em;margin-top:14px}
+.login-sub{font-size:12px;color:var(--text3);margin-top:6px}
+
 @media(max-width:768px){
-  .mob-hd{display:flex;height:65px;padding:0 20px;}
-  .mob-tl-group .lang-btn{font-size:13px;padding:7px 10px;border-radius:8px;}
-  .theme-toggle{font-size:18px;padding:7px 10px;border-radius:8px;}
-  .mob-hd span{font-size:22px !important;}
-  .sidebar{transform:none !important;width:100% !important;height:78px;top:auto;bottom:0;border-right:none;border-top:1px solid var(--border);flex-direction:row;padding:0;background:var(--surface);box-shadow:0 -4px 20px rgba(0,0,0,0.5);}
-  .light-mode .sidebar{box-shadow:0 -4px 20px rgba(0,0,0,0.06);}
-  .sb-brand,.sb-bottom{display:none !important;}
-  .sb-nav{flex-direction:row;width:100%;padding:0;align-items:center;justify-content:space-between;gap:0;}
-  .nav-item{flex:1;padding:12px 0;border-radius:0;}
-  .nav-icon{width:24px;height:24px;margin-bottom:5px;}
-  .nav-label{font-size:10px;letter-spacing:0;}
-  .nav-badge{top:6px;right:50%;transform:translateX(10px);min-width:18px;height:18px;font-size:10px;}
-  .logout-mob{display:flex;}
-  .main{margin-left:0;padding-top:85px;padding-left:18px;padding-right:18px;padding-bottom:100px;}
-  .page-title{font-size:24px;}
-  .page-sub{font-size:13px;margin-top:5px;}
-  .btn{font-size:14px;padding:10px 18px;}
-  .btn-sm{font-size:12px;padding:8px 14px;}
-  .stats-row{grid-template-columns:1fr 1fr;gap:14px;margin-bottom:18px;}
-  .stat-card{padding:22px;border-radius:16px;}
-  .stat-label{font-size:12px;margin-bottom:12px;}
-  .stat-val{font-size:26px;}
-  .stat-unit{font-size:14px;}
-  .grid-2{grid-template-columns:1fr;gap:14px;margin-bottom:14px;}
-  .card{padding:22px;border-radius:16px;margin-bottom:14px;}
-  .card-title{font-size:16px;margin-bottom:16px;}
-  .chart-container{height:220px;width:100%}
-  #cpu-v,#mem-v{font-size:22px !important;}
-  .sl-k,.sl-v{font-size:14px;padding:14px 0;}
+  .mob-hd{display:flex;height:60px;padding:0 18px;position:fixed;top:0;left:0;right:0;background:color-mix(in srgb,var(--surface) 90%,transparent);border-bottom:1px solid var(--border);z-index:90;align-items:center;justify-content:space-between;backdrop-filter:blur(18px)}
+  .mob-tl-group .lang-btn{font-size:12px;padding:6px 10px}
+  .theme-toggle{font-size:15px}
+  .sidebar{top:auto;bottom:0;height:74px;border-bottom:none;border-top:1px solid var(--border);background:color-mix(in srgb,var(--surface) 94%,transparent);padding:0;box-shadow:0 -8px 24px rgba(0,0,0,.25)}
+  .sb-brand,.sb-bottom{display:none !important}
+  .sb-nav{height:100%;padding:0 4px;gap:0}
+  .nav-item{flex:1;flex-direction:column;gap:4px;height:100%;border-radius:0;padding:0}
+  .nav-item.active{background:none}
+  .nav-icon{width:21px;height:21px}
+  .nav-label{font-size:10px}
+  .nav-badge{position:absolute;top:8px;left:calc(50% + 10px);min-width:15px;height:15px;font-size:9px}
+  .logout-mob{display:flex}
+  .main{margin-top:60px;padding:18px 16px 100px}
+  .page-title{font-size:22px}
+  .page-sub{font-size:12.5px}
+  .btn{font-size:13px;padding:10px 16px}
+  .btn-sm{font-size:12px;padding:8px 13px}
+  .stats-row{grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}
+  .stat-card{padding:18px;border-radius:var(--radius-lg)}
+  .stat-val{font-size:22px}
+  .grid-2{grid-template-columns:1fr;gap:12px;margin-bottom:12px}
+  .card{padding:18px}
+  .card-title{font-size:14.5px}
+  .chart-container{height:210px}
+  .sl-k,.sl-v{font-size:13px}
   .tbl-wrap{display:none}
-  .m-cards{display:flex;}
-  .m-card{padding:18px;border-radius:14px;}
-  .m-card-hd span{font-size:16px !important;}
-  .pill-used{font-size:13px;}
-  .pill-lim{font-size:12px;}
-  .m-card-acts .act-btn{font-size:12px;padding:8px 14px;border-radius:8px;}
-  .mo-box{padding:28px 24px;border-radius:20px;}
-  .fi,.fs{font-size:16px;padding:12px 16px;}
-  .fl{font-size:11px;margin-bottom:6px;}
+  .m-cards{display:flex}
+  .m-card-acts .act-btn{font-size:11.5px;padding:7px 12px}
+  .mo-box{padding:26px 22px}
+  .fi,.fs{font-size:16px;padding:11px 14px}
 }
-@media(max-width:460px){.stats-row{grid-template-columns:1fr;gap:14px;}}
+@media(max-width:460px){.stats-row{grid-template-columns:1fr;gap:12px}}
+
 </style>
 </head>
 <body>
@@ -945,15 +1327,9 @@ body[dir="rtl"]{direction:rtl;text-align:right}
   <div class="login-wrap">
     <div class="login-box">
       <div class="login-logo">
-        <svg width="52" height="44" viewBox="0 0 84 68" fill="none">
-          <ellipse cx="42" cy="52" rx="40" ry="11" fill="#C8900A" opacity=".85"/>
-          <ellipse cx="42" cy="52" rx="40" ry="11" fill="none" stroke="#FFD700" stroke-width="1.4" opacity=".6"/>
-          <path d="M19 50 Q21 22 42 17 Q63 22 65 50" fill="#D4960C" stroke="#FFD700" stroke-width="1.4"/>
-          <ellipse cx="42" cy="17" rx="23" ry="5.5" fill="#C8900A" stroke="#FFD700" stroke-width="1"/>
-          <path d="M20 45 Q21.5 41.5 42 39.5 Q62.5 41.5 64 45" fill="none" stroke="#CC2200" stroke-width="4.5" stroke-linecap="round" opacity=".92"/>
-        </svg>
-        <div class="login-title">LUFFY PANEL</div>
-        <div class="login-sub">Enter your password to continue</div>
+        <div class="sb-hat" style="width:44px;height:44px;border-radius:13px;font-size:19px">L</div>
+        <div class="login-title">Luffy Panel</div>
+        <div class="login-sub" data-en="Enter your password to continue" data-fa="رمز عبور را برای ادامه وارد کنید">Enter your password to continue</div>
       </div>
       <div class="fg">
         <label class="fl">PASSWORD</label>
@@ -977,23 +1353,14 @@ body[dir="rtl"]{direction:rtl;text-align:right}
         <button class="lang-btn lang-fa" onclick="setLang('fa')">FA</button>
       </div>
     </div>
-    <span style="font-family:'Cinzel',serif;font-size:16px;font-weight:700;color:var(--gold);letter-spacing:1px;">LUFFY</span>
+    <span style="font-family:'Sora',sans-serif;font-size:15px;font-weight:700;color:var(--text);letter-spacing:-.01em;">Luffy Panel</span>
   </div>
 
   <!-- SIDEBAR / BOTTOM NAV -->
   <aside class="sidebar" id="sb">
     <div class="sb-brand">
-      <div class="sb-hat">
-        <svg width="36" height="30" viewBox="0 0 84 68" fill="none">
-          <ellipse cx="42" cy="52" rx="40" ry="11" fill="#C8900A" opacity=".85"/>
-          <ellipse cx="42" cy="52" rx="40" ry="11" fill="none" stroke="#FFD700" stroke-width="1.4" opacity=".6"/>
-          <path d="M19 50 Q21 22 42 17 Q63 22 65 50" fill="#D4960C" stroke="#FFD700" stroke-width="1.4"/>
-          <ellipse cx="42" cy="17" rx="23" ry="5.5" fill="#C8900A" stroke="#FFD700" stroke-width="1"/>
-          <path d="M20 45 Q21.5 41.5 42 39.5 Q62.5 41.5 64 45" fill="none" stroke="#CC2200" stroke-width="4.5" stroke-linecap="round" opacity=".92"/>
-          <ellipse cx="35" cy="24" rx="5" ry="3" fill="rgba(255,255,255,.1)" transform="rotate(-20 35 24)"/>
-        </svg>
-      </div>
-      <div class="sb-title">LUFFY</div>
+      <div class="sb-hat">L</div>
+      <div class="sb-title">Luffy Panel</div>
     </div>
     <nav class="sb-nav">
       <button class="nav-item active" data-page="dashboard">
@@ -1008,6 +1375,11 @@ body[dir="rtl"]{direction:rtl;text-align:right}
       <button class="nav-item" data-page="traffic">
         <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
         <span class="nav-label" data-en="Traffic" data-fa="ترافیک">Traffic</span>
+      </button>
+      <button class="nav-item" data-page="live">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3" fill="currentColor" stroke="none"/></svg>
+        <span class="nav-label" data-en="Live" data-fa="زنده">Live</span>
+        <span class="nav-badge" id="nl2">0</span>
       </button>
       <button class="nav-item" data-page="addresses">
         <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/></svg>
@@ -1058,8 +1430,8 @@ body[dir="rtl"]{direction:rtl;text-align:right}
       </div>
       <div class="grid-2">
         <div class="card">
-          <div class="card-hd"><div class="card-title" data-en="CPU" data-fa="پردازنده">CPU</div><span id="cpu-v" style="font-size:17px;font-weight:700;color:var(--gold)">–%</span></div>
-          <div class="sys-bar"><div class="sys-fill" id="cpu-b" style="background:var(--gold)"></div></div>
+          <div class="card-hd"><div class="card-title" data-en="CPU" data-fa="پردازنده">CPU</div><span id="cpu-v" style="font-size:17px;font-weight:700;color:var(--accent)">–%</span></div>
+          <div class="sys-bar"><div class="sys-fill" id="cpu-b" style="background:var(--accent)"></div></div>
         </div>
         <div class="card">
           <div class="card-hd"><div class="card-title" data-en="Memory" data-fa="حافظه">Memory</div><span id="mem-v" style="font-size:17px;font-weight:700;color:var(--green)">–%</span></div>
@@ -1079,6 +1451,7 @@ body[dir="rtl"]{direction:rtl;text-align:right}
           <div class="page-title" data-en="Inbounds" data-fa="اینباندها">Inbounds</div>
           <div class="page-sub" data-en="VLESS over WebSocket · TLS" data-fa="VLESS روی WebSocket با TLS">VLESS over WebSocket · TLS</div>
         </div>
+        <button class="btn btn-ghost" onclick="showBulkMo()" data-en="⚡ Bulk Create" data-fa="⚡ ساخت گروهی">⚡ Bulk Create</button>
         <button class="btn btn-gold" onclick="showAddMo()" data-en="+ Add" data-fa="+ افزودن">+ Add</button>
       </div>
       <div class="tb">
@@ -1113,6 +1486,29 @@ body[dir="rtl"]{direction:rtl;text-align:right}
       </div>
     </section>
 
+    <!-- Live Connections -->
+    <section class="page" id="page-live">
+      <div class="page-header">
+        <div><div class="page-title" data-en="Live Connections" data-fa="اتصالات زنده">Live Connections</div><div class="page-sub" data-en="Who's connected right now" data-fa="چه کسی الان متصل است">Who's connected right now</div></div>
+        <span class="tag" style="background:var(--green-dim);color:var(--green)"><span id="live-count">0</span>&nbsp;<span data-en="online" data-fa="آنلاین">online</span></span>
+      </div>
+      <div class="card" style="padding:0;overflow:hidden">
+        <div class="tbl-wrap" style="border:none">
+          <table class="tbl">
+            <thead><tr>
+              <th data-en="User" data-fa="کاربر">User</th>
+              <th data-en="IP Address" data-fa="آدرس آی‌پی">IP Address</th>
+              <th data-en="Connected" data-fa="مدت اتصال">Connected</th>
+              <th data-en="Data" data-fa="داده">Data</th>
+              <th></th>
+            </tr></thead>
+            <tbody id="live-tb"></tbody>
+          </table>
+        </div>
+        <div class="empty" id="live-empty" style="display:none" data-en="No active connections" data-fa="هیچ اتصال فعالی نیست">No active connections</div>
+      </div>
+    </section>
+
     <!-- Traffic -->
     <section class="page" id="page-traffic">
       <div class="page-header"><div><div class="page-title" data-en="Traffic" data-fa="ترافیک">Traffic</div><div class="page-sub" data-en="Statistics" data-fa="آمار">Statistics</div></div></div>
@@ -1143,6 +1539,13 @@ body[dir="rtl"]{direction:rtl;text-align:right}
         <div class="fg"><label class="fl" data-en="New Password" data-fa="رمز جدید">New Password</label><input class="fi" type="password" id="npw" data-ph-en="Min 4 chars" data-ph-fa="حداقل ۴ کاراکتر" placeholder="Min 4 chars"></div>
         <button class="btn btn-gold" onclick="chgPw()" style="margin-top:10px;width:100%;justify-content:center;" data-en="Update Password" data-fa="بروزرسانی رمز">Update Password</button>
       </div>
+      <div class="card" style="max-width:380px">
+        <div class="card-hd"><div class="card-title" data-en="Backup &amp; Restore" data-fa="پشتیبان‌گیری و بازیابی">Backup &amp; Restore</div></div>
+        <div style="font-size:11.5px;color:var(--text3);margin-bottom:12px" data-en="Inbound data is stored on disk, but exporting a backup protects you against accidental loss." data-fa="اطلاعات اینباندها روی دیسک ذخیره می‌شود، اما گرفتن بک‌آپ شما را در برابر از دست رفتن تصادفی داده محافظت می‌کند.">Inbound data is stored on disk, but exporting a backup protects you against accidental loss.</div>
+        <button class="btn btn-ghost" onclick="downloadBackup()" style="width:100%;justify-content:center;margin-bottom:8px;" data-en="⬇ Export Backup" data-fa="⬇ خروجی بک‌آپ">⬇ Export Backup</button>
+        <input type="file" id="restore-file" accept="application/json" style="display:none" onchange="restoreBackup(this.files[0])">
+        <button class="btn btn-ghost" onclick="document.getElementById('restore-file').click()" style="width:100%;justify-content:center;" data-en="⬆ Restore From File" data-fa="⬆ بازیابی از فایل">⬆ Restore From File</button>
+      </div>
     </section>
 
   </main>
@@ -1161,6 +1564,24 @@ body[dir="rtl"]{direction:rtl;text-align:right}
     <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="nc" type="number" min="0" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
     <div class="fg"><label class="fl" data-en="Days Valid" data-fa="روزهای اعتبار">Days Valid</label><input class="fi" id="nd" type="number" min="0" data-ph-en="0 = No expiry" data-ph-fa="۰ = بدون انقضا" placeholder="0 = No expiry"></div>
     <button class="btn btn-gold" onclick="createLink()" style="width:100%;justify-content:center;margin-top:12px;padding:12px;" data-en="CREATE" data-fa="ایجاد">CREATE</button>
+  </div>
+</div>
+
+<div class="mo" id="mo-bulk" onclick="if(event.target===this)this.classList.remove('show')">
+  <div class="mo-box">
+    <button class="mo-close" onclick="document.getElementById('mo-bulk').classList.remove('show')">✕</button>
+    <div class="mo-title" data-en="BULK CREATE" data-fa="ساخت گروهی">BULK CREATE</div>
+    <div class="fr">
+      <div class="fg"><label class="fl" data-en="Name Prefix" data-fa="پیشوند نام">Name Prefix</label><input class="fi" id="bp" data-ph-en="e.g. User" data-ph-fa="مثلاً کاربر" placeholder="e.g. User" value="User"></div>
+      <div class="fg" style="max-width:90px"><label class="fl" data-en="Count" data-fa="تعداد">Count</label><input class="fi" id="bn" type="number" min="1" max="200" value="5"></div>
+    </div>
+    <div class="fr">
+      <div class="fg"><label class="fl" data-en="Traffic Limit" data-fa="محدودیت ترافیک">Traffic Limit</label><input class="fi" id="bv" type="number" min="0" step=".1" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
+      <div class="fg" style="max-width:100px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="bu"><option>GB</option></select></div>
+    </div>
+    <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="bc" type="number" min="0" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
+    <div class="fg"><label class="fl" data-en="Days Valid" data-fa="روزهای اعتبار">Days Valid</label><input class="fi" id="bd" type="number" min="0" data-ph-en="0 = No expiry" data-ph-fa="۰ = بدون انقضا" placeholder="0 = No expiry"></div>
+    <button class="btn btn-gold" onclick="bulkCreate()" style="width:100%;justify-content:center;margin-top:12px;padding:12px;" data-en="CREATE ALL" data-fa="ایجاد همه">CREATE ALL</button>
   </div>
 </div>
 
@@ -1210,10 +1631,10 @@ function $m(id){return document.getElementById(id);}
 function esc(s){return String(s).replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 
 const langMap={
-  en:{edit:'Edit',copy:'Copy',sub:'Sub',qr:'QR',del:'Del'},
-  fa:{edit:'ویرایش',copy:'کپی',sub:'اشتراک',qr:'QR',del:'حذف'}
+  en:{edit:'Edit',copy:'Copy',sub:'Sub',qr:'QR',del:'Del',share:'Share',status:'Status'},
+  fa:{edit:'ویرایش',copy:'کپی',sub:'اشتراک',qr:'QR',del:'حذف',share:'اشتراک امن',status:'وضعیت'}
 };
-function tr(key){return(langMap[lang]&&langMap[lang][key])langMap['en'][key]key;}
+function tr(key){return (langMap[lang]&&langMap[lang][key]) ? langMap[lang][key] : (langMap['en'][key]||key);}
 
 let lang=localStorage.getItem('ll')||'en';
 let theme=localStorage.getItem('theme')||'dark';
@@ -1319,6 +1740,8 @@ function switchPage(id){
   const target=$m('page-'+id);
   if(target)target.classList.add('active');
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.page===id));
+  if(id==='live'){loadLiveConnections();clearInterval(window._liveInterval);window._liveInterval=setInterval(loadLiveConnections,4000);}
+  else{clearInterval(window._liveInterval);}
 }
 
 // ── Toast ─────────────────────────────────────────────────────────────────────
@@ -1378,7 +1801,7 @@ function renderLinks(links){
     tb.innerHTML='';
     mc.innerHTML='';
     em.style.display='block';
-    const emptyText=em.getAttribute('data-'+lang)em.getAttribute('data-en')'No inbounds found';
+    const emptyText=em.getAttribute('data-'+lang)||em.getAttribute('data-en')||'No inbounds found';
     em.textContent=emptyText;
     return;
   }
@@ -1388,7 +1811,7 @@ function renderLinks(links){
     const u=l.used_bytes||0;
     const lim=l.limit_bytes||0;
     const pct=lim>0?Math.min(100,(u/lim)*100):0;
-    const col=pct>90?'var(--red)':pct>70?'var(--yellow)':'var(--gold)';
+    const col=pct>90?'var(--red)':pct>70?'var(--yellow)':'var(--accent)';
     const ex=fmtExp(l.expires_at);
     const ec=ex==='Expired'?'var(--red)':ex==='∞'?'var(--text3)':'var(--text2)';
     const i=idx--;
@@ -1402,8 +1825,10 @@ function renderLinks(links){
   const subText=tr('sub');
   const qrText=tr('qr');
   const delText=tr('del');
+  const shareText=tr('share');
+  const statusText=tr('status');
 
-  tb.innerHTML=rows.map(r=><tr>
+  tb.innerHTML=rows.map(r=>`<tr>
     <td style="color:var(--text3);font-size:10.5px">${r.i}</td>
     <td style="font-weight:600">${esc(r.l.label)}</td>
     <td><span class="tag tag-vless">VLESS</span></td>
@@ -1417,11 +1842,13 @@ function renderLinks(links){
       <button class="act-btn act-copy" onclick="cpLink('${esc(r.l.vless_link||'')}')">${copyText}</button>
       <button class="act-btn act-sub" onclick="cpSub('${r.l.uuid}')">${subText}</button>
       <button class="act-btn act-qr" onclick="showQR('${esc(r.l.vless_link||'')}')">${qrText}</button>
+      <button class="act-btn act-sub" style="background:var(--purple-dim);color:var(--purple)" onclick="shareLink('${r.l.uuid}')">${shareText}</button>
+      <button class="act-btn act-copy" onclick="cpStatus('${r.l.uuid}')">${statusText}</button>
       <button class="act-btn act-del" onclick="delLink('${r.l.uuid}')">${delText}</button>
     </div></td>
-  </tr>).join('');
+  </tr>`).join('');
 
-  mc.innerHTML=rows.map(r=><div class="m-card">
+  mc.innerHTML=rows.map(r=>`<div class="m-card">
     <div class="m-card-hd">
       <div style="display:flex;align-items:center;gap:7px">
         <span style="font-size:11px;color:var(--text3)">#${r.i}</span>
@@ -1437,9 +1864,11 @@ function renderLinks(links){
       <button class="act-btn act-copy" onclick="cpLink('${esc(r.l.vless_link||'')}')">${copyText}</button>
       <button class="act-btn act-sub" onclick="cpSub('${r.l.uuid}')">${subText}</button>
       <button class="act-btn act-qr" onclick="showQR('${esc(r.l.vless_link||'')}')">${qrText}</button>
+      <button class="act-btn act-sub" style="background:var(--purple-dim);color:var(--purple)" onclick="shareLink('${r.l.uuid}')">${shareText}</button>
+      <button class="act-btn act-copy" onclick="cpStatus('${r.l.uuid}')">${statusText}</button>
       <button class="act-btn act-del" onclick="delLink('${r.l.uuid}')">${delText}</button>
     </div>
-  </div>).join('');
+  </div>`).join('');
 }
 
 async function togLink(el){
@@ -1497,6 +1926,67 @@ async function createLink(){
     await loadLinks();
     await loadStats();
   }catch(e){toast('Error creating link',true);}
+}
+
+function showBulkMo(){$m('mo-bulk').classList.add('show');}
+
+async function bulkCreate(){
+  const prefix=$m('bp').value.trim()||'User';
+  if(!/^[a-zA-Z0-9\-_. ]+$/.test(prefix)){toast('Only English letters allowed',true);return;}
+  const count=parseInt($m('bn').value)||0;
+  if(count<1||count>200){toast('Count must be 1-200',true);return;}
+  const v=parseFloat($m('bv').value)||0;
+  const mc=parseInt($m('bc').value)||0;
+  const days=parseInt($m('bd').value)||0;
+  try{
+    const r=await fetch('/api/links/bulk',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({prefix,count,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days})
+    });
+    if(!r.ok){const d=await r.json().catch(()=>({}));throw new Error(d.detail||'Error');}
+    const d=await r.json();
+    toast('Created '+d.count+' inbounds');
+    $m('bn').value='5';$m('bv').value='';$m('bc').value='';$m('bd').value='';
+    $m('mo-bulk').classList.remove('show');
+    await loadLinks();
+    await loadStats();
+  }catch(e){toast(e.message||'Error bulk creating',true);}
+}
+
+async function downloadBackup(){
+  try{
+    const r=await fetch('/api/backup');
+    if(!r.ok)throw new Error();
+    const blob=await r.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url;a.download='luffy-backup-'+Date.now()+'.json';
+    a.click();
+    URL.revokeObjectURL(url);
+    toast('Backup exported');
+  }catch(e){toast('Error exporting backup',true);}
+}
+
+async function restoreBackup(file){
+  if(!file)return;
+  if(!confirm('This will replace all current inbounds and addresses. Continue?'))return;
+  try{
+    const text=await file.text();
+    const data=JSON.parse(text);
+    const r=await fetch('/api/restore',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(data)
+    });
+    if(!r.ok){const d=await r.json().catch(()=>({}));throw new Error(d.detail||'Error');}
+    const d=await r.json();
+    toast('Restored '+d.restored_links+' inbounds');
+    await loadLinks();
+    await loadAddrs();
+    await loadStats();
+  }catch(e){toast(e.message||'Invalid backup file',true);}
+  $m('restore-file').value='';
 }
 
 function showEditMo(uid){
@@ -1569,6 +2059,63 @@ async function cpSub(uid){
   }catch(e){toast('Failed to copy',true);}
 }
 
+async function shareLink(uid){
+  try{
+    const r=await fetch('/api/links/'+uid+'/share',{method:'POST'});
+    if(!r.ok)throw new Error();
+    const d=await r.json();
+    await navigator.clipboard.writeText(d.share_url);
+    toast('One-time link copied — valid for a single view!');
+  }catch(e){toast('Error creating share link',true);}
+}
+
+async function cpStatus(uid){
+  try{
+    await navigator.clipboard.writeText('https://'+location.host+'/status/'+uid);
+    toast('Status page link copied!');
+  }catch(e){toast('Failed to copy',true);}
+}
+
+function timeAgo(iso){
+  if(!iso)return '–';
+  const s=Math.floor((Date.now()-new Date(iso).getTime())/1000);
+  if(s<60)return s+'s';
+  if(s<3600)return Math.floor(s/60)+'m '+(s%60)+'s';
+  return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m';
+}
+
+async function loadLiveConnections(){
+  try{
+    const r=await fetch('/api/connections');
+    if(!r.ok)return;
+    const d=await r.json();
+    $m('live-count').textContent=d.count;
+    const nl2=$m('nl2');if(nl2)nl2.textContent=d.count;
+    const tb=$m('live-tb'),empty=$m('live-empty');
+    if(!d.connections.length){
+      tb.innerHTML='';
+      empty.style.display='block';
+      return;
+    }
+    empty.style.display='none';
+    tb.innerHTML=d.connections.map(c=>`<tr>
+      <td style="font-weight:600">${esc(c.label||c.uuid)}</td>
+      <td style="font-family:'JetBrains Mono',monospace;font-size:11.5px;color:var(--text2)">${esc(c.ip||'–')}</td>
+      <td style="font-size:11.5px;color:var(--text2)">${timeAgo(c.connected_at)}</td>
+      <td style="font-family:'JetBrains Mono',monospace;font-size:11px">${fmtB(c.bytes||0)}</td>
+      <td><button class="act-btn act-del" onclick="kickConn('${c.conn_id}')" data-en="Disconnect" data-fa="قطع">Disconnect</button></td>
+    </tr>`).join('');
+  }catch(e){}
+}
+
+async function kickConn(connId){
+  try{
+    await fetch('/api/connections/'+connId,{method:'DELETE'});
+    toast('Connection closed');
+    loadLiveConnections();
+  }catch(e){toast('Error disconnecting',true);}
+}
+
 function showQR(txt){
   if(!txt){toast('No QR data',true);return;}
   $m('qr-img').src='https://api.qrserver.com/v1/create-qr-code/?size=280x280&data='+encodeURIComponent(txt);
@@ -1600,7 +2147,7 @@ async function loadStats(){
     if($m('t-up'))$m('t-up').textContent=sData.uptime||'–';
     if(sData.cpu_percent!==undefined){
       const c=sData.cpu_percent;
-      const cc=c>80?'var(--red)':c>50?'var(--yellow)':'var(--gold)';
+      const cc=c>80?'var(--red)':c>50?'var(--yellow)':'var(--accent)';
       $m('cpu-v').textContent=c.toFixed(1)+'%';
       $m('cpu-v').style.color=cc;
       $m('cpu-b').style.width=c+'%';
@@ -1657,7 +2204,7 @@ function initChart(){
     type:'bar',
     data:{
       labels:[],
-      datasets:[{label:'MB',data:[],backgroundColor:'rgba(255,215,0,0.55)',borderColor:'#FFD700',borderWidth:1,borderRadius:4}]
+      datasets:[{label:'MB',data:[],backgroundColor:'rgba(99,102,241,0.55)',borderColor:'#6366F1',borderWidth:1,borderRadius:4}]
     },
     options:{
       responsive:true,maintainAspectRatio:false,
@@ -1708,13 +2255,13 @@ function renderAddrs(){
     el.innerHTML='<div style="color:var(--text3);font-size:12px">No addresses added</div>';
     return;
   }
-  el.innerHTML=allAddrs.map((a,i)=><div style="display:flex;align-items:center;justify-content:space-between;padding:12px 14px;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px">
+  el.innerHTML=allAddrs.map((a,i)=>`<div style="display:flex;align-items:center;justify-content:space-between;padding:12px 14px;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px">
     <div style="display:flex;align-items:center;gap:10px">
-      <span style="color:var(--gold);font-size:16px">🌐</span>
+      <span style="color:var(--accent);font-size:16px">🌐</span>
       <div><div style="font-size:14px;font-weight:600">${esc(a)}</div><div style="font-size:11px;color:var(--text3);margin-top:2px;">Address #${i+1}</div></div>
     </div>
     <button class="act-btn act-del" onclick="delAddr(${i})">${tr('del')}</button>
-  </div>).join('');
+  </div>`).join('');
 }
 
 function showAddAddrMo(){$m('na').value='';$m('mo-addr').classList.add('show');}
@@ -1778,5 +2325,5 @@ async def dashboard_page(request: Request):
 async def panel_page(request: Request):
     return HTMLResponse(content=PANEL_HTML)
 
-if name == "main":
+if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=CONFIG["port"])
