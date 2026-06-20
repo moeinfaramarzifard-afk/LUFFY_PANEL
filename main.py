@@ -883,39 +883,6 @@ async def client_status_page(uid: str):
     """
     return HTMLResponse(_public_page(f"{link['label']} · Status", body))
 
-# ── Live connections ────────────────────────────────────────────────────────────
-@app.get("/api/connections")
-async def list_connections(_=Depends(require_auth)):
-    async with LINKS_LOCK:
-        labels = {uid: data["label"] for uid, data in LINKS.items()}
-    async with connections_lock:
-        items = [
-            {
-                "conn_id": cid,
-                "uuid": info.get("uuid"),
-                "label": labels.get(info.get("uuid"), info.get("uuid")),
-                "ip": info.get("ip"),
-                "connected_at": info.get("connected_at"),
-                "bytes": info.get("bytes", 0),
-            }
-            for cid, info in connections.items()
-        ]
-    items.sort(key=lambda x: x["connected_at"] or "", reverse=True)
-    return {"connections": items, "count": len(items)}
-
-@app.delete("/api/connections/{conn_id}")
-async def kick_connection(conn_id: str, _=Depends(require_auth)):
-    ws = connection_sockets.get(conn_id)
-    if ws:
-        try:
-            await ws.close(code=1000, reason="disconnected by admin")
-        except Exception:
-            pass
-    async with connections_lock:
-        connections.pop(conn_id, None)
-    connection_sockets.pop(conn_id, None)
-    return {"ok": True}
-
 # ── WebSocket tunnel ──────────────────────────────────────────────────────────
 RELAY_BUF = 64 * 1024
 
