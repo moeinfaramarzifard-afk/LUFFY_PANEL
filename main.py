@@ -669,6 +669,45 @@ async def delete_address(index: int, _=Depends(require_auth)):
     await db_delete_address(removed)
     return {"ok": True, "addresses": list(CUSTOM_ADDRESSES)}
 
+PING_TIMEOUT_SECONDS = 5.0
+PING_PORT = 443
+
+async def _tcp_ping(address: str) -> dict:
+    """Open a TCP connection to address:443 and measure the time to connect.
+    This mirrors the real-world cost of a VLESS-over-TLS handshake target,
+    so it's a more meaningful signal than ICMP ping for this use case."""
+    start = time.monotonic()
+    writer = None
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(address, PING_PORT), timeout=PING_TIMEOUT_SECONDS
+        )
+        elapsed_ms = round((time.monotonic() - start) * 1000)
+        return {"address": address, "ok": True, "ms": elapsed_ms}
+    except asyncio.TimeoutError:
+        return {"address": address, "ok": False, "error": "timeout"}
+    except (OSError, ConnectionError) as exc:
+        return {"address": address, "ok": False, "error": str(exc) or "connection failed"}
+    except Exception as exc:
+        return {"address": address, "ok": False, "error": str(exc) or "failed"}
+    finally:
+        if writer is not None:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+@app.post("/api/addresses/ping")
+async def ping_addresses(_=Depends(require_auth)):
+    """Test TCP-connect latency to port 443 for every saved custom address, in parallel."""
+    async with CUSTOM_ADDRESSES_LOCK:
+        addresses = list(CUSTOM_ADDRESSES)
+    if not addresses:
+        return {"results": []}
+    results = await asyncio.gather(*(_tcp_ping(addr) for addr in addresses))
+    return {"results": results}
+
 @app.get("/api/backup")
 async def export_backup(_=Depends(require_auth)):
     """Full JSON export of inbounds + addresses, downloadable for safekeeping."""
@@ -1528,7 +1567,10 @@ body{font-family:'Inter',sans-serif;color:var(--text);display:flex;flex-directio
     <section class="page" id="page-addresses">
       <div class="page-header">
         <div><div class="page-title">Clean IP</div><div class="page-sub">Subscription alternative addresses</div></div>
-        <button class="btn btn-gold" onclick="showAddAddrMo()">+ Add</button>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-ghost" id="ping-btn" onclick="pingAddrs()">⚡ Test Speed</button>
+          <button class="btn btn-gold" onclick="showAddAddrMo()">+ Add</button>
+        </div>
       </div>
       <div class="card">
         <div style="font-size:12px;color:var(--text3);margin-bottom:12px">Default: www.speedtest.net</div>
@@ -1641,6 +1683,7 @@ let cf='all';
 let sData={};
 let tChart=null;
 let allAddrs=[];
+let pingResults={};
 let isAuthenticated=false;
 
 // ── Theme ────────────────────────────────────────────────────────────────────
@@ -2192,13 +2235,65 @@ function renderAddrs(){
     el.innerHTML='<div style="color:var(--text3);font-size:12px">No addresses added</div>';
     return;
   }
-  el.innerHTML=allAddrs.map((a,i)=>`<div style="display:flex;align-items:center;justify-content:space-between;padding:12px 14px;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px">
+  const indexed=allAddrs.map((a,i)=>({a,i}));
+  indexed.sort((x,y)=>{
+    const px=pingResults[x.a],py=pingResults[y.a];
+    const okx=px&&px.ok, oky=py&&py.ok;
+    if(okx&&oky)return px.ms-py.ms;
+    if(okx&&!oky)return -1;
+    if(!okx&&oky)return 1;
+    return x.i-y.i;
+  });
+  el.innerHTML=indexed.map(({a,i})=>{
+    const p=pingResults[a];
+    let badge='';
+    if(p){
+      if(p.pending){
+        badge='<span class="tag" style="background:var(--surface3);color:var(--text3)">⏳ Testing…</span>';
+      }else if(p.ok){
+        const col=p.ms<150?'var(--green)':(p.ms<400?'var(--yellow)':'var(--red)');
+        const dim=p.ms<150?'var(--green-dim)':(p.ms<400?'var(--yellow-dim)':'var(--red-dim)');
+        badge=`<span class="tag" style="background:${dim};color:${col}">${p.ms} ms</span>`;
+      }else{
+        badge='<span class="tag" style="background:var(--red-dim);color:var(--red)">Failed</span>';
+      }
+    }
+    return `<div style="display:flex;align-items:center;justify-content:space-between;padding:12px 14px;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px">
     <div style="display:flex;align-items:center;gap:10px">
       <span style="color:var(--accent);font-size:16px">🌐</span>
       <div><div style="font-size:14px;font-weight:600">${esc(a)}</div><div style="font-size:11px;color:var(--text3);margin-top:2px;">Address #${i+1}</div></div>
     </div>
-    <button class="act-btn act-del" onclick="delAddr(${i})">Del</button>
-  </div>`).join('');
+    <div style="display:flex;align-items:center;gap:8px">
+      ${badge}
+      <button class="act-btn act-del" onclick="delAddr(${i})">Del</button>
+    </div>
+  </div>`;
+  }).join('');
+}
+
+async function pingAddrs(){
+  if(!allAddrs||!allAddrs.length){toast('No addresses to test',true);return;}
+  const btn=$m('ping-btn');
+  if(btn){btn.disabled=true;btn.textContent='⏳ Testing…';}
+  pingResults={};
+  allAddrs.forEach(a=>{pingResults[a]={pending:true};});
+  renderAddrs();
+  try{
+    const r=await fetch('/api/addresses/ping',{method:'POST'});
+    if(!r.ok)throw new Error();
+    const d=await r.json();
+    pingResults={};
+    (d.results||[]).forEach(res=>{pingResults[res.address]=res;});
+    renderAddrs();
+    const okCount=(d.results||[]).filter(x=>x.ok).length;
+    toast(`Tested ${d.results.length} addresses · ${okCount} reachable`);
+  }catch(e){
+    toast('Speed test failed',true);
+    pingResults={};
+    renderAddrs();
+  }finally{
+    if(btn){btn.disabled=false;btn.textContent='⚡ Test Speed';}
+  }
 }
 
 function showAddAddrMo(){$m('na').value='';$m('mo-addr').classList.add('show');}
