@@ -3106,7 +3106,7 @@ async function pingAddr(host,i){
   for(let n=0;n<3;n++){
     const t0=performance.now();
     try{
-      await fetch('https://'+host+'/favicon.ico?_='+Date.now(),{mode:'no-cors',cache:'no-store'});
+      await fetch('https://www.gstatic.com/generate_204?_='+Date.now(),{mode:'no-cors',cache:'no-store'});
       samples.push(performance.now()-t0);
     }catch(e){/* opaque/blocked responses still resolve the timing in most cases */}
   }
