@@ -3097,25 +3097,40 @@ function renderAddrs(){
   allAddrs.forEach((a,i)=>pingAddr(a,i));
 }
 
+function imgPing(url,timeoutMs){
+  return new Promise(resolve=>{
+    const img=new Image();
+    const t0=performance.now();
+    let done=false;
+    const finish=ok=>{
+      if(done)return;
+      done=true;
+      resolve(ok?performance.now()-t0:null);
+    };
+    img.onload=()=>finish(true);
+    img.onerror=()=>finish(true); // a fast error still proves the round trip completed
+    setTimeout(()=>finish(false),timeoutMs);
+    img.src=url+(url.includes('?')?'&':'?')+'_t='+Date.now()+Math.random();
+  });
+}
+
 async function pingAddr(host,i){
   const el=$m('ping-'+i);
   if(!el)return;
   el.textContent='…';
   el.style.color='var(--text3)';
   const samples=[];
-  for(let n=0;n<3;n++){
-    const t0=performance.now();
-    try{
-      await fetch('https://www.gstatic.com/generate_204?_='+Date.now(),{mode:'no-cors',cache:'no-store'});
-      samples.push(performance.now()-t0);
-    }catch(e){/* opaque/blocked responses still resolve the timing in most cases */}
+  for(let n=0;n<4;n++){
+    const ms=await imgPing('https://www.google.com/favicon.ico',2500);
+    if(ms!==null)samples.push(ms);
   }
   if(!samples.length){
     el.textContent='timeout';
     el.style.color='var(--red)';
     return;
   }
-  const ms=Math.round(Math.min(...samples));
+  samples.sort((a,b)=>a-b);
+  const ms=Math.round(samples[Math.floor(samples.length/2)]); // median, less noisy than min/max
   el.textContent=ms+' ms';
   el.style.color=ms<150?'var(--green)':ms<350?'var(--yellow)':'var(--red)';
 }
