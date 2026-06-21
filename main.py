@@ -435,62 +435,10 @@ def get_client_ip(websocket: WebSocket) -> str:
         return websocket.client.host
     return "unknown"
 
-# Recognize common VLESS/V2Ray client apps + OS platform from the WebSocket
-# handshake's User-Agent header. Best-effort only — clients can send anything.
-_DEVICE_APP_PATTERNS = [
-    (re.compile(r'v2rayNG', re.I), "v2rayNG"),
-    (re.compile(r'v2rayN\b', re.I), "v2rayN"),
-    (re.compile(r'Shadowrocket', re.I), "Shadowrocket"),
-    (re.compile(r'Streisand', re.I), "Streisand"),
-    (re.compile(r'Stash', re.I), "Stash"),
-    (re.compile(r'Clash[\s\-]?Meta', re.I), "Clash Meta"),
-    (re.compile(r'ClashX', re.I), "ClashX"),
-    (re.compile(r'Clash', re.I), "Clash"),
-    (re.compile(r'NekoBox|NekoRay', re.I), "NekoBox"),
-    (re.compile(r'Hiddify', re.I), "Hiddify"),
-    (re.compile(r'FairVPN|FairVPN', re.I), "FairVPN"),
-    (re.compile(r'Sing-?[Bb]ox|SFA|SFI|SFM|SFT', re.I), "sing-box"),
-    (re.compile(r'Loon', re.I), "Loon"),
-    (re.compile(r'Quantumult', re.I), "Quantumult"),
-    (re.compile(r'Surge', re.I), "Surge"),
-]
-_DEVICE_OS_PATTERNS = [
-    (re.compile(r'Android', re.I), "Android"),
-    (re.compile(r'iPhone|iPad|iOS|CFNetwork', re.I), "iOS"),
-    (re.compile(r'Windows', re.I), "Windows"),
-    (re.compile(r'Mac ?OS|Macintosh|Darwin', re.I), "macOS"),
-    (re.compile(r'Linux', re.I), "Linux"),
-]
-
-def parse_user_agent(ua: str) -> str | None:
-    """Returns a short human label like 'v2rayNG · Android', or just the OS / app
-    alone if only one is detected. Returns None if nothing recognizable is found."""
-    if not ua:
-        return None
-    app = next((label for pattern, label in _DEVICE_APP_PATTERNS if pattern.search(ua)), None)
-    os_name = next((label for pattern, label in _DEVICE_OS_PATTERNS if pattern.search(ua)), None)
-    if app and os_name:
-        return f"{app} · {os_name}"
-    if app:
-        return app
-    if os_name:
-        return os_name
-    return None
-
 # lock used here
 async def count_connections_for_link(uid: str) -> int:
     async with connections_lock:
         return sum(1 for info in connections.values() if info.get("uuid") == uid)
-
-async def current_device_label_for_link(uid: str) -> str | None:
-    """Returns the device/app label of the most recently connected active
-    session for this link, or None if no connection is currently open."""
-    async with connections_lock:
-        matches = [info for info in connections.values() if info.get("uuid") == uid]
-    if not matches:
-        return None
-    latest = max(matches, key=lambda info: info.get("connected_at") or "")
-    return latest.get("device_label")
 
 async def remove_ip_from_link(uid: str, ip: str):
     async with connections_lock:
@@ -810,7 +758,6 @@ async def list_links(_=Depends(require_auth)):
             "created_at": data["created_at"],
             "expires_at": data.get("expires_at"),
             "current_connections": await count_connections_for_link(uid),  # FIX: await
-            "device_label": await current_device_label_for_link(uid),
             "vless_link": generate_vless_link(uid, remark=f"meiteeam-{data['label']}"),
             "group_id": gid,
             "group_name": group_names.get(gid) if gid else None,
@@ -1423,13 +1370,11 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
             return
 
         conn_id = secrets.token_urlsafe(8)
-        device_label = parse_user_agent(websocket.headers.get("user-agent", ""))
         async with connections_lock:
             connections[conn_id] = {
                 "uuid": uuid, "ip": client_ip,
                 "connected_at": datetime.now(timezone.utc).isoformat(),
                 "bytes": 0,
-                "device_label": device_label,
             }
             connection_sockets[conn_id] = websocket
             link_ip_map[uuid].add(client_ip)
@@ -2229,7 +2174,7 @@ function renderLinks(links){
 
   tb.innerHTML=rows.map(r=>`<tr>
     <td style="color:var(--text3);font-size:10.5px">${r.i}</td>
-    <td style="font-weight:600">${esc(r.l.label)}${r.l.group_name?`<span class="tag" style="background:var(--purple-dim);color:var(--purple);margin-left:6px;font-size:9px">${esc(r.l.group_name)}</span>`:''}${r.l.device_label?`<span class="tag" style="background:var(--green-dim);color:var(--green);margin-left:6px;font-size:9px">● ${esc(r.l.device_label)}</span>`:''}</td>
+    <td style="font-weight:600">${esc(r.l.label)}${r.l.group_name?`<span class="tag" style="background:var(--purple-dim);color:var(--purple);margin-left:6px;font-size:9px">${esc(r.l.group_name)}</span>`:''}</td>
     <td><span class="tag tag-vless">VLESS</span></td>
     <td><div class="pill"><span class="pill-used">${fmtB(r.u)}</span><div class="pill-bar"><div class="pill-fill" style="width:${r.pct}%;background:${r.col}"></div></div><span class="pill-lim">${fmtLim(r.lim)}</span></div></td>
     <td style="font-size:11px;font-weight:600;color:${r.mc2>0&&r.cc>=r.mc2?'var(--red)':'var(--text2)'}">${r.cc}/${r.mc2||'∞'}</td>
@@ -2254,7 +2199,6 @@ function renderLinks(links){
         <span style="font-weight:600;font-size:14px">${esc(r.l.label)}</span>
         <span class="tag tag-vless">VLESS</span>
         ${r.l.group_name?`<span class="tag" style="background:var(--purple-dim);color:var(--purple)">${esc(r.l.group_name)}</span>`:''}
-        ${r.l.device_label?`<span class="tag" style="background:var(--green-dim);color:var(--green)">● ${esc(r.l.device_label)}</span>`:''}
       </div>
       <button class="toggle ${r.l.active?'on':''}" data-uid="${r.l.uuid}" onclick="togLink(this)"></button>
     </div>
