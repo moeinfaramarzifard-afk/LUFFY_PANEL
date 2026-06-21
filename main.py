@@ -627,6 +627,27 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
                     LINKS[uid]["expires_at"] = None
             except (ValueError, TypeError):
                 pass
+        if "extend_days" in body:
+            try:
+                ed = int(body["extend_days"])
+                if ed != 0:
+                    current_exp = parse_expires_at(LINKS[uid].get("expires_at"))
+                    base = current_exp if (current_exp is not None and current_exp > datetime.now(timezone.utc)) else datetime.now(timezone.utc)
+                    LINKS[uid]["expires_at"] = (base + timedelta(days=ed)).isoformat()
+                    LINKS[uid]["notified_expiry"] = False
+            except (ValueError, TypeError):
+                pass
+        if "expires_at_date" in body:
+            raw_date = body.get("expires_at_date")
+            if raw_date:
+                try:
+                    new_exp = datetime.fromisoformat(str(raw_date)).replace(tzinfo=timezone.utc)
+                    LINKS[uid]["expires_at"] = new_exp.isoformat()
+                    LINKS[uid]["notified_expiry"] = False
+                except (ValueError, TypeError):
+                    raise HTTPException(status_code=400, detail="Invalid expiry date format")
+            else:
+                LINKS[uid]["expires_at"] = None
         link_copy = dict(LINKS[uid])
     await db_save_link(uid, link_copy)
     return {"ok": True}
@@ -1601,7 +1622,21 @@ body{font-family:'Inter',sans-serif;color:var(--text);display:flex;flex-directio
       <div class="fg" style="max-width:100px"><label class="fl">Unit</label><select class="fs" id="eu2"><option>GB</option></select></div>
     </div>
     <div class="fg"><label class="fl">Max IPs</label><input class="fi" id="ec" type="number" min="0" placeholder="0 = ∞"></div>
-    <div class="fg"><label class="fl">Extend Days</label><input class="fi" id="ed" type="number" min="0" placeholder="0 = no change"></div>
+    <div class="fg">
+      <label class="fl">Expires</label>
+      <div id="e-exp-current" style="font-size:11.5px;color:var(--text3);margin-bottom:8px"></div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
+        <button type="button" class="btn btn-ghost btn-sm" onclick="quickExtend(7)" style="padding:7px 11px;font-size:12px">+7d</button>
+        <button type="button" class="btn btn-ghost btn-sm" onclick="quickExtend(30)" style="padding:7px 11px;font-size:12px">+30d</button>
+        <button type="button" class="btn btn-ghost btn-sm" onclick="quickExtend(90)" style="padding:7px 11px;font-size:12px">+90d</button>
+        <button type="button" class="btn btn-ghost btn-sm" onclick="setNeverExpires()" style="padding:7px 11px;font-size:12px;color:var(--text3)">Never expires</button>
+      </div>
+      <div class="fr">
+        <input class="fi" id="ed" type="number" placeholder="Custom +/- days (0 = no change)">
+        <input class="fi" id="e-exp-date" type="date" style="max-width:150px" onchange="$m('ed').value='';$m('ed').dataset.clear='';">
+      </div>
+      <div style="font-size:10.5px;color:var(--text3);margin-top:5px">Use either the +/- days field or pick an exact date — not both.</div>
+    </div>
     <div style="display:flex;gap:10px;margin-top:16px">
       <button class="btn btn-gold" onclick="saveEdit()" style="flex:1;justify-content:center;padding:12px;">SAVE</button>
       <button class="btn btn-danger" onclick="resetTraf()" style="padding:12px;">Reset Traffic</button>
@@ -1974,8 +2009,29 @@ function showEditMo(uid){
   $m('el').value=l.limit_bytes>0?(l.limit_bytes/1073741824):'';
   $m('ec').value=l.max_connections>0?l.max_connections:'';
   $m('ed').value='';
+  $m('ed').dataset.clear='';
+  if(l.expires_at){
+    const expDate=new Date(l.expires_at);
+    $m('e-exp-current').textContent='Currently expires: '+expDate.toLocaleDateString()+' '+expDate.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+    $m('e-exp-date').value=expDate.toISOString().slice(0,10);
+  }else{
+    $m('e-exp-current').textContent='Currently: never expires';
+    $m('e-exp-date').value='';
+  }
   $m('et').textContent='EDIT: '+l.label;
   $m('mo-edit').classList.add('show');
+}
+
+function quickExtend(days){
+  $m('ed').value=days;
+  $m('e-exp-date').value='';
+  $m('ed').dataset.clear='';
+}
+
+function setNeverExpires(){
+  $m('ed').value='';
+  $m('e-exp-date').value='';
+  $m('ed').dataset.clear='1';
 }
 
 async function saveEdit(){
@@ -1983,8 +2039,12 @@ async function saveEdit(){
   const v=parseFloat($m('el').value)||0;
   const mc=parseInt($m('ec').value)||0;
   const days=parseInt($m('ed').value)||0;
+  const dateVal=$m('e-exp-date').value;
+  const clearExpiry=$m('ed').dataset.clear==='1';
   const body={limit_value:v,limit_unit:'GB',max_connections:mc};
-  if(days>0)body.days_valid=days;
+  if(clearExpiry)body.expires_at_date=null;
+  else if(days!==0)body.extend_days=days;
+  else if(dateVal)body.expires_at_date=dateVal;
   try{
     const r=await fetch('/api/links/'+uid,{
       method:'PATCH',
@@ -1993,6 +2053,7 @@ async function saveEdit(){
     });
     if(!r.ok)throw new Error();
     toast('Updated');
+    $m('ed').dataset.clear='';
     $m('mo-edit').classList.remove('show');
     await loadLinks();
   }catch(e){toast('Error updating',true);}
@@ -2263,4 +2324,3 @@ async def panel_page(request: Request):
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=CONFIG["port"])
-
