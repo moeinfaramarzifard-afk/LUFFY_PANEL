@@ -27,8 +27,8 @@ CONFIG = {
     "port": int(os.environ.get("PORT", 8000)),
     "secret": os.environ.get("SECRET_KEY", secrets.token_urlsafe(32)),
     "db_path": os.environ.get("DB_PATH", "meiteeam.db"),
-    "tg_token": os.environ.get("TELEGRAM_BOT_TOKEN", "6613307125:AAGiWMpHAZZft9rmlmfehQ-glA-rH11w0bs"),
-    "tg_chat_id": os.environ.get("TELEGRAM_CHAT_ID", "6088506002"),
+    "tg_token": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+    "tg_chat_id": os.environ.get("TELEGRAM_CHAT_ID", ""),
 }
 
 # NOTE: allow_origins=["*"] together with allow_credentials=True is not honored by
@@ -2324,10 +2324,7 @@ body{font-family:'Inter',sans-serif;color:var(--text);display:flex;flex-directio
         <div class="page-eyebrow">Routing</div>
         <div class="page-header-row">
           <div><div class="page-title">Clean IP</div><div class="page-sub">Subscription alternative addresses</div></div>
-          <div style="display:flex;gap:8px">
-            <button class="btn btn-ghost" onclick="pingAllAddrs()">⚡ Ping All</button>
-            <button class="btn btn-gold" onclick="showAddAddrMo()">+ Add</button>
-          </div>
+          <button class="btn btn-gold" onclick="showAddAddrMo()">+ Add</button>
         </div>
         <div class="page-rule"></div>
       </div>
@@ -3088,55 +3085,8 @@ function renderAddrs(){
       <span style="color:var(--accent);font-size:16px">🌐</span>
       <div><div style="font-size:14px;font-weight:600">${esc(a)}</div><div style="font-size:11px;color:var(--text3);margin-top:2px;">Address #${i+1}</div></div>
     </div>
-    <div style="display:flex;align-items:center;gap:8px">
-      <span id="ping-${i}" style="font-family:'JetBrains Mono',monospace;font-size:11.5px;font-weight:600;color:var(--text3);min-width:58px;text-align:right">–</span>
-      <button class="act-btn act-copy" onclick="pingAddr('${esc(a)}',${i})">Ping</button>
-      <button class="act-btn act-del" onclick="delAddr(${i})">Del</button>
-    </div>
+    <button class="act-btn act-del" onclick="delAddr(${i})">Del</button>
   </div>`).join('');
-  allAddrs.forEach((a,i)=>pingAddr(a,i));
-}
-
-function imgPing(url,timeoutMs){
-  return new Promise(resolve=>{
-    const img=new Image();
-    const t0=performance.now();
-    let done=false;
-    const finish=ok=>{
-      if(done)return;
-      done=true;
-      resolve(ok?performance.now()-t0:null);
-    };
-    img.onload=()=>finish(true);
-    img.onerror=()=>finish(true); // a fast error still proves the round trip completed
-    setTimeout(()=>finish(false),timeoutMs);
-    img.src=url+(url.includes('?')?'&':'?')+'_t='+Date.now()+Math.random();
-  });
-}
-
-async function pingAddr(host,i){
-  const el=$m('ping-'+i);
-  if(!el)return;
-  el.textContent='…';
-  el.style.color='var(--text3)';
-  const samples=[];
-  for(let n=0;n<4;n++){
-    const ms=await imgPing('https://www.google.com/favicon.ico',2500);
-    if(ms!==null)samples.push(ms);
-  }
-  if(!samples.length){
-    el.textContent='timeout';
-    el.style.color='var(--red)';
-    return;
-  }
-  samples.sort((a,b)=>a-b);
-  const ms=Math.round(samples[Math.floor(samples.length/2)]); // median, less noisy than min/max
-  el.textContent=ms+' ms';
-  el.style.color=ms<150?'var(--green)':ms<350?'var(--yellow)':'var(--red)';
-}
-
-async function pingAllAddrs(){
-  allAddrs.forEach((a,i)=>pingAddr(a,i));
 }
 
 function showAddAddrMo(){$m('na').value='';$m('mo-addr').classList.add('show');}
