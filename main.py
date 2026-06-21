@@ -2324,7 +2324,10 @@ body{font-family:'Inter',sans-serif;color:var(--text);display:flex;flex-directio
         <div class="page-eyebrow">Routing</div>
         <div class="page-header-row">
           <div><div class="page-title">Clean IP</div><div class="page-sub">Subscription alternative addresses</div></div>
-          <button class="btn btn-gold" onclick="showAddAddrMo()">+ Add</button>
+          <div style="display:flex;gap:8px">
+            <button class="btn btn-ghost" onclick="pingAllAddrs()">⚡ Ping All</button>
+            <button class="btn btn-gold" onclick="showAddAddrMo()">+ Add</button>
+          </div>
         </div>
         <div class="page-rule"></div>
       </div>
@@ -3085,8 +3088,40 @@ function renderAddrs(){
       <span style="color:var(--accent);font-size:16px">🌐</span>
       <div><div style="font-size:14px;font-weight:600">${esc(a)}</div><div style="font-size:11px;color:var(--text3);margin-top:2px;">Address #${i+1}</div></div>
     </div>
-    <button class="act-btn act-del" onclick="delAddr(${i})">Del</button>
+    <div style="display:flex;align-items:center;gap:8px">
+      <span id="ping-${i}" style="font-family:'JetBrains Mono',monospace;font-size:11.5px;font-weight:600;color:var(--text3);min-width:58px;text-align:right">–</span>
+      <button class="act-btn act-copy" onclick="pingAddr('${esc(a)}',${i})">Ping</button>
+      <button class="act-btn act-del" onclick="delAddr(${i})">Del</button>
+    </div>
   </div>`).join('');
+  allAddrs.forEach((a,i)=>pingAddr(a,i));
+}
+
+async function pingAddr(host,i){
+  const el=$m('ping-'+i);
+  if(!el)return;
+  el.textContent='…';
+  el.style.color='var(--text3)';
+  const samples=[];
+  for(let n=0;n<3;n++){
+    const t0=performance.now();
+    try{
+      await fetch('https://'+host+'/favicon.ico?_='+Date.now(),{mode:'no-cors',cache:'no-store'});
+      samples.push(performance.now()-t0);
+    }catch(e){/* opaque/blocked responses still resolve the timing in most cases */}
+  }
+  if(!samples.length){
+    el.textContent='timeout';
+    el.style.color='var(--red)';
+    return;
+  }
+  const ms=Math.round(Math.min(...samples));
+  el.textContent=ms+' ms';
+  el.style.color=ms<150?'var(--green)':ms<350?'var(--yellow)':'var(--red)';
+}
+
+async function pingAllAddrs(){
+  allAddrs.forEach((a,i)=>pingAddr(a,i));
 }
 
 function showAddAddrMo(){$m('na').value='';$m('mo-addr').classList.add('show');}
