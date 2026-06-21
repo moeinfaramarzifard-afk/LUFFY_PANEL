@@ -252,8 +252,253 @@ async def telegram_answer_callback(callback_id: str, text: str = ""):
     except Exception:
         pass
 
+ADMIN_STATE: dict = {"awaiting": None}   # simple single-admin conversation state
+
+def _tg_main_menu():
+    return [
+        [{"text": "📋 List Users", "callback_data": "menu:list"}, {"text": "➕ Add User", "callback_data": "menu:add"}],
+        [{"text": "🛒 Pending Orders", "callback_data": "menu:orders"}, {"text": "📊 Stats", "callback_data": "menu:stats"}],
+        [{"text": "🌐 Addresses", "callback_data": "menu:addr"}],
+    ]
+
+async def telegram_send_keyboard(chat_id, text: str, rows: list):
+    token = CONFIG["tg_token"]
+    if not token:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML", "reply_markup": {"inline_keyboard": rows}}
+            )
+    except Exception:
+        pass
+
+async def telegram_edit_keyboard(chat_id, message_id, text: str, rows: list):
+    token = CONFIG["tg_token"]
+    if not token:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{token}/editMessageText",
+                json={"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML", "reply_markup": {"inline_keyboard": rows}}
+            )
+    except Exception:
+        pass
+
+def _user_detail_text(uid: str, link: dict) -> str:
+    used_str = _fmt_bytes(link["used_bytes"])
+    limit_str = "∞" if link["limit_bytes"] == 0 else _fmt_bytes(link["limit_bytes"])
+    status = "🟢 Active" if link["active"] else "🔴 Inactive"
+    exp = link.get("expires_at")
+    exp_str = "Never" if not exp else exp[:10]
+    return f"<b>{link['label']}</b>\n\n{status}\nData: {used_str} / {limit_str}\nExpires: {exp_str}\nMax devices: {link.get('max_connections') or '∞'}"
+
+def _user_detail_buttons(uid: str, link: dict):
+    toggle_label = "🔴 Turn Off" if link["active"] else "🟢 Turn On"
+    return [
+        [{"text": toggle_label, "callback_data": f"tgl:{uid}"}, {"text": "🔄 Reset Usage", "callback_data": f"rst:{uid}"}],
+        [{"text": "🔗 Share Link", "callback_data": f"shr:{uid}"}, {"text": "🗑 Delete", "callback_data": f"delc:{uid}"}],
+        [{"text": "« Back to list", "callback_data": "menu:list"}],
+    ]
+
+async def _handle_bot_message(chat_id, text: str):
+    text = (text or "").strip()
+    if text in ("/start", "/menu"):
+        ADMIN_STATE["awaiting"] = None
+        await telegram_send_keyboard(chat_id, "👋 <b>Meiteeam Admin Bot</b>\nChoose an action:", _tg_main_menu())
+        return
+    if ADMIN_STATE.get("awaiting") == "add":
+        parts = [p.strip() for p in text.split(",")]
+        if len(parts) < 1 or not parts[0]:
+            await telegram_notify("Format: <code>Label, GB, Days</code> — e.g. <code>John, 50, 30</code>")
+            return
+        label = parts[0][:60]
+        try:
+            gb = float(parts[1]) if len(parts) > 1 and parts[1] else 0
+            days = int(parts[2]) if len(parts) > 2 and parts[2] else 0
+        except ValueError:
+            await telegram_notify("GB and Days must be numbers. Try again: <code>Label, GB, Days</code>")
+            return
+        if not re.match(r'^[a-zA-Z0-9\-_. ]+$', label):
+            await telegram_notify("Label must contain only English letters, numbers, - _ . and spaces.")
+            return
+        order = {"label": label, "gb": gb, "days": days}
+        uid = await _provision_order(order)
+        ADMIN_STATE["awaiting"] = None
+        vless_link = generate_vless_link(uid, remark=f"Meiteeam-{label}")
+        sub_url = f"https://{get_domain()}/sub/{uid}"
+        await telegram_notify(f"✅ Created <b>{label}</b>\n\nSub URL:\n<code>{sub_url}</code>\n\nConfig:\n<code>{vless_link}</code>")
+        await telegram_send_keyboard(chat_id, "What next?", _tg_main_menu())
+        return
+    await telegram_send_keyboard(chat_id, "Not sure what you mean — use the menu below.", _tg_main_menu())
+
+async def _handle_bot_callback(cq: dict):
+    from_id = str(cq.get("from", {}).get("id", ""))
+    cdata = cq.get("data", "")
+    msg = cq.get("message", {})
+    chat_id = msg.get("chat", {}).get("id")
+    message_id = msg.get("message_id")
+    admin_id = CONFIG["tg_chat_id"]
+    if from_id != str(admin_id):
+        await telegram_answer_callback(cq["id"], "Not authorized")
+        return
+    if ":" not in cdata:
+        await telegram_answer_callback(cq["id"])
+        return
+    action, arg = cdata.split(":", 1)
+
+    if action == "menu":
+        await telegram_answer_callback(cq["id"])
+        if arg == "list":
+            async with LINKS_LOCK:
+                items = list(LINKS.items())
+            if not items:
+                await telegram_edit_keyboard(chat_id, message_id, "No users yet.", [[{"text": "« Back", "callback_data": "menu:back"}]])
+                return
+            rows = [[{"text": f"{('🟢' if l['active'] else '🔴')} {l['label']}", "callback_data": f"user:{uid}"}] for uid, l in items[:50]]
+            rows.append([{"text": "« Back", "callback_data": "menu:back"}])
+            await telegram_edit_keyboard(chat_id, message_id, f"<b>Users</b> ({len(items)})", rows)
+        elif arg == "add":
+            ADMIN_STATE["awaiting"] = "add"
+            await telegram_edit_keyboard(chat_id, message_id, "Send the new user as:\n<code>Label, GB, Days</code>\n\ne.g. <code>John, 50, 30</code> (0 = unlimited)", [[{"text": "« Cancel", "callback_data": "menu:back"}]])
+        elif arg == "orders":
+            pending = [(oid, o) for oid, o in ORDERS.items() if o["status"] == "pending"]
+            if not pending:
+                await telegram_edit_keyboard(chat_id, message_id, "No pending orders.", [[{"text": "« Back", "callback_data": "menu:back"}]])
+                return
+            rows = [[{"text": f"🛒 {o['label']} ({o['gb']}GB/{o['days']}d)", "callback_data": f"ord:{oid}"}] for oid, o in pending[:30]]
+            rows.append([{"text": "« Back", "callback_data": "menu:back"}])
+            await telegram_edit_keyboard(chat_id, message_id, f"<b>Pending Orders</b> ({len(pending)})", rows)
+        elif arg == "stats":
+            async with LINKS_LOCK:
+                count = len(LINKS)
+                total_used = sum(l["used_bytes"] for l in LINKS.values())
+            cpu = psutil.cpu_percent(interval=0.1)
+            mem = psutil.virtual_memory().percent
+            text = f"<b>📊 Stats</b>\n\nUsers: {count}\nTotal traffic: {_fmt_bytes(total_used)}\nCPU: {cpu}%\nMemory: {mem}%"
+            await telegram_edit_keyboard(chat_id, message_id, text, [[{"text": "« Back", "callback_data": "menu:back"}]])
+        elif arg == "addr":
+            addrs = "\n".join(f"• {a}" for a in CUSTOM_ADDRESSES) or "No clean IPs configured."
+            await telegram_edit_keyboard(chat_id, message_id, f"<b>🌐 Clean IPs</b>\n\n{addrs}", [[{"text": "« Back", "callback_data": "menu:back"}]])
+        elif arg == "back":
+            ADMIN_STATE["awaiting"] = None
+            await telegram_edit_keyboard(chat_id, message_id, "👋 <b>Meiteeam Admin Bot</b>\nChoose an action:", _tg_main_menu())
+        return
+
+    if action == "user":
+        await telegram_answer_callback(cq["id"])
+        async with LINKS_LOCK:
+            link = LINKS.get(arg)
+        if not link:
+            await telegram_edit_keyboard(chat_id, message_id, "User not found.", [[{"text": "« Back", "callback_data": "menu:list"}]])
+            return
+        await telegram_edit_keyboard(chat_id, message_id, _user_detail_text(arg, link), _user_detail_buttons(arg, link))
+        return
+
+    if action == "tgl":
+        async with LINKS_LOCK:
+            link = LINKS.get(arg)
+            if link:
+                link["active"] = not link["active"]
+                link_copy = dict(link)
+        if link:
+            await db_save_link(arg, link_copy)
+            await telegram_answer_callback(cq["id"], "Toggled")
+            await telegram_edit_keyboard(chat_id, message_id, _user_detail_text(arg, link_copy), _user_detail_buttons(arg, link_copy))
+        else:
+            await telegram_answer_callback(cq["id"], "Not found")
+        return
+
+    if action == "rst":
+        async with LINKS_LOCK:
+            link = LINKS.get(arg)
+            if link:
+                link["used_bytes"] = 0
+                link["notified_quota"] = False
+                link_copy = dict(link)
+        if link:
+            await db_save_link(arg, link_copy)
+            await telegram_answer_callback(cq["id"], "Usage reset")
+            await telegram_edit_keyboard(chat_id, message_id, _user_detail_text(arg, link_copy), _user_detail_buttons(arg, link_copy))
+        else:
+            await telegram_answer_callback(cq["id"], "Not found")
+        return
+
+    if action == "shr":
+        async with LINKS_LOCK:
+            exists = arg in LINKS
+        if not exists:
+            await telegram_answer_callback(cq["id"], "Not found")
+            return
+        for tok, info in list(SHARE_TOKENS.items()):
+            if info["expires_at"] < time.time():
+                SHARE_TOKENS.pop(tok, None)
+        token = secrets.token_urlsafe(24)
+        SHARE_TOKENS[token] = {"uid": arg, "created_at": time.time(), "expires_at": time.time() + 86400, "used": False}
+        await telegram_answer_callback(cq["id"], "Link sent below")
+        await telegram_notify(f"🔗 One-time share link for <b>{arg}</b>:\nhttps://{get_domain()}/share/{token}")
+        return
+
+    if action == "delc":
+        await telegram_answer_callback(cq["id"])
+        await telegram_edit_keyboard(chat_id, message_id, f"Delete <b>{arg}</b>? This cannot be undone.", [
+            [{"text": "✅ Yes, delete", "callback_data": f"delx:{arg}"}, {"text": "« Cancel", "callback_data": f"user:{arg}"}],
+        ])
+        return
+
+    if action == "delx":
+        async with LINKS_LOCK:
+            LINKS.pop(arg, None)
+        await close_connections_for_link(arg)
+        await db_delete_link(arg)
+        await telegram_answer_callback(cq["id"], "Deleted")
+        await telegram_edit_keyboard(chat_id, message_id, f"🗑 Deleted <b>{arg}</b>.", [[{"text": "« Back to list", "callback_data": "menu:list"}]])
+        return
+
+    if action == "ord":
+        order = ORDERS.get(arg)
+        if not order or order["status"] != "pending":
+            await telegram_answer_callback(cq["id"], "Not available")
+            return
+        await telegram_answer_callback(cq["id"])
+        gb_str = "Unlimited" if order["gb"] <= 0 else f"{order['gb']}GB"
+        days_str = "No expiry" if order["days"] <= 0 else f"{order['days']} days"
+        text = f"🛒 <b>{order['label']}</b>\n{gb_str} / {days_str}"
+        if order.get("note"):
+            text += f"\nNote: {order['note']}"
+        await telegram_edit_keyboard(chat_id, message_id, text, [
+            [{"text": "✅ Approve", "callback_data": f"appr:{arg}"}, {"text": "❌ Reject", "callback_data": f"rej:{arg}"}],
+            [{"text": "« Back", "callback_data": "menu:orders"}],
+        ])
+        return
+
+    if action in ("appr", "rej"):
+        order_id = arg
+        order = ORDERS.get(order_id)
+        if order is None:
+            await telegram_answer_callback(cq["id"], "Order not found")
+            return
+        if order["status"] != "pending":
+            await telegram_answer_callback(cq["id"], "Already handled")
+            return
+        if action == "appr":
+            uid = await _provision_order(order)
+            order["status"] = "approved"
+            order["uid"] = uid
+            await telegram_answer_callback(cq["id"], "Approved ✅")
+            await telegram_edit_keyboard(chat_id, message_id, f"✅ Approved — <b>{order['label']}</b> ({order['gb']}GB / {order['days']}d) is live.", [[{"text": "« Menu", "callback_data": "menu:back"}]])
+        else:
+            order["status"] = "rejected"
+            await telegram_answer_callback(cq["id"], "Rejected ❌")
+            await telegram_edit_keyboard(chat_id, message_id, f"❌ Rejected — <b>{order['label']}</b> request.", [[{"text": "« Menu", "callback_data": "menu:back"}]])
+        return
+
+    await telegram_answer_callback(cq["id"])
+
 async def order_telegram_poller():
-    """Long-polls Telegram for Approve/Reject button taps on order requests."""
+    """Long-polls Telegram for the admin bot menu, user management buttons, and order approvals."""
     offset = 0
     while True:
         token, admin_id = CONFIG["tg_token"], CONFIG["tg_chat_id"]
@@ -264,7 +509,7 @@ async def order_telegram_poller():
             async with httpx.AsyncClient(timeout=35.0) as client:
                 r = await client.get(
                     f"https://api.telegram.org/bot{token}/getUpdates",
-                    params={"offset": offset, "timeout": 25, "allowed_updates": '["callback_query"]'}
+                    params={"offset": offset, "timeout": 25, "allowed_updates": '["callback_query","message"]'}
                 )
                 data = r.json()
         except Exception:
@@ -273,36 +518,21 @@ async def order_telegram_poller():
         for update in data.get("result", []):
             offset = update["update_id"] + 1
             cq = update.get("callback_query")
-            if not cq:
+            if cq:
+                try:
+                    await _handle_bot_callback(cq)
+                except Exception:
+                    logger.exception("telegram callback handling failed")
                 continue
-            from_id = str(cq.get("from", {}).get("id", ""))
-            cdata = cq.get("data", "")
-            msg = cq.get("message", {})
-            chat_id = msg.get("chat", {}).get("id")
-            message_id = msg.get("message_id")
-            if from_id != str(admin_id) or ":" not in cdata:
-                await telegram_answer_callback(cq["id"], "Not authorized")
-                continue
-            action, order_id = cdata.split(":", 1)
-            order = ORDERS.get(order_id)
-            if order is None:
-                await telegram_answer_callback(cq["id"], "Order not found")
-                continue
-            if order["status"] != "pending":
-                await telegram_answer_callback(cq["id"], "Already handled")
-                continue
-            if action == "appr":
-                uid = await _provision_order(order)
-                order["status"] = "approved"
-                order["uid"] = uid
-                await telegram_answer_callback(cq["id"], "Approved ✅")
-                if chat_id and message_id:
-                    await telegram_edit_message(chat_id, message_id, f"✅ Approved — <b>{order['label']}</b> ({order['gb']}GB / {order['days']}d) is live.")
-            elif action == "rej":
-                order["status"] = "rejected"
-                await telegram_answer_callback(cq["id"], "Rejected ❌")
-                if chat_id and message_id:
-                    await telegram_edit_message(chat_id, message_id, f"❌ Rejected — <b>{order['label']}</b> request.")
+            msg = update.get("message")
+            if msg:
+                from_id = str(msg.get("from", {}).get("id", ""))
+                if from_id != str(admin_id):
+                    continue
+                try:
+                    await _handle_bot_message(msg.get("chat", {}).get("id"), msg.get("text", ""))
+                except Exception:
+                    logger.exception("telegram message handling failed")
 
 async def _provision_order(order: dict) -> str:
     """Creates the actual inbound for an approved order. Returns the uid."""
