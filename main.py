@@ -258,60 +258,8 @@ def _tg_main_menu():
     return [
         [{"text": "📋 List Users", "callback_data": "menu:list"}, {"text": "➕ Add User", "callback_data": "menu:add"}],
         [{"text": "🛒 Pending Orders", "callback_data": "menu:orders"}, {"text": "📊 Stats", "callback_data": "menu:stats"}],
-        [{"text": "🌐 Addresses", "callback_data": "menu:addr"}, {"text": "📅 Daily Report", "callback_data": "menu:report"}],
+        [{"text": "🌐 Addresses", "callback_data": "menu:addr"}],
     ]
-
-async def build_daily_report() -> str:
-    async with LINKS_LOCK:
-        items = list(LINKS.items())
-    total_users = len(items)
-    active_users = sum(1 for _, l in items if l["active"])
-    total_used = sum(l["used_bytes"] for _, l in items)
-    near_quota = []
-    near_expiry = []
-    for uid, l in items:
-        if l["limit_bytes"] > 0:
-            pct = l["used_bytes"] / l["limit_bytes"] * 100
-            if pct >= 80:
-                near_quota.append((l["label"], round(pct)))
-        secs = seconds_until_expiry(l.get("expires_at"))
-        if secs is not None and 0 < secs <= 3 * 86400:
-            near_expiry.append((l["label"], secs // 86400))
-    cpu = psutil.cpu_percent(interval=0.1)
-    mem = psutil.virtual_memory().percent
-    lines = [
-        "📅 <b>Daily Report</b>",
-        "",
-        f"👥 Users: {total_users} total, {active_users} active",
-        f"📊 Total traffic: {_fmt_bytes(total_used)}",
-        f"🖥 CPU: {cpu}% · RAM: {mem}%",
-    ]
-    if near_quota:
-        lines.append("")
-        lines.append("⚠️ <b>Near quota (≥80%)</b>")
-        for label, pct in near_quota[:10]:
-            lines.append(f"• {label} — {pct}%")
-    if near_expiry:
-        lines.append("")
-        lines.append("⏳ <b>Expiring soon (≤3 days)</b>")
-        for label, days in near_expiry[:10]:
-            lines.append(f"• {label} — {days}d left")
-    if not near_quota and not near_expiry:
-        lines.append("")
-        lines.append("✅ No users near quota or expiry.")
-    return "\n".join(lines)
-
-async def daily_report_scheduler():
-    """Sends an automatic daily report to the admin every 24h (first run ~1 min after startup)."""
-    await asyncio.sleep(60)
-    while True:
-        if CONFIG["tg_token"] and CONFIG["tg_chat_id"]:
-            try:
-                text = await build_daily_report()
-                await telegram_notify(text)
-            except Exception:
-                logger.exception("daily report send failed")
-        await asyncio.sleep(86400)
 
 async def telegram_send_keyboard(chat_id, text: str, rows: list):
     token = CONFIG["tg_token"]
@@ -434,9 +382,6 @@ async def _handle_bot_callback(cq: dict):
         elif arg == "addr":
             addrs = "\n".join(f"• {a}" for a in CUSTOM_ADDRESSES) or "No clean IPs configured."
             await telegram_edit_keyboard(chat_id, message_id, f"<b>🌐 Clean IPs</b>\n\n{addrs}", [[{"text": "« Back", "callback_data": "menu:back"}]])
-        elif arg == "report":
-            text = await build_daily_report()
-            await telegram_edit_keyboard(chat_id, message_id, text, [[{"text": "« Back", "callback_data": "menu:back"}]])
         elif arg == "back":
             ADMIN_STATE["awaiting"] = None
             await telegram_edit_keyboard(chat_id, message_id, "👋 <b>Meiteeam Admin Bot</b>\nChoose an action:", _tg_main_menu())
@@ -748,7 +693,6 @@ async def startup():
     asyncio.create_task(flush_usage_to_db())
     asyncio.create_task(quota_expiry_watcher())
     asyncio.create_task(order_telegram_poller())
-    asyncio.create_task(daily_report_scheduler())
     await ensure_default_link()
 
 @app.on_event("shutdown")
@@ -3153,40 +3097,25 @@ function renderAddrs(){
   allAddrs.forEach((a,i)=>pingAddr(a,i));
 }
 
-function imgPing(url,timeoutMs){
-  return new Promise(resolve=>{
-    const img=new Image();
-    const t0=performance.now();
-    let done=false;
-    const finish=ok=>{
-      if(done)return;
-      done=true;
-      resolve(ok?performance.now()-t0:null);
-    };
-    img.onload=()=>finish(true);
-    img.onerror=()=>finish(true); // a fast error still proves the round trip completed
-    setTimeout(()=>finish(false),timeoutMs);
-    img.src=url+(url.includes('?')?'&':'?')+'_t='+Date.now()+Math.random();
-  });
-}
-
 async function pingAddr(host,i){
   const el=$m('ping-'+i);
   if(!el)return;
   el.textContent='…';
   el.style.color='var(--text3)';
   const samples=[];
-  for(let n=0;n<4;n++){
-    const ms=await imgPing('https://www.google.com/favicon.ico',2500);
-    if(ms!==null)samples.push(ms);
+  for(let n=0;n<3;n++){
+    const t0=performance.now();
+    try{
+      await fetch('https://www.gstatic.com/generate_204?_='+Date.now(),{mode:'no-cors',cache:'no-store'});
+      samples.push(performance.now()-t0);
+    }catch(e){/* opaque/blocked responses still resolve the timing in most cases */}
   }
   if(!samples.length){
     el.textContent='timeout';
     el.style.color='var(--red)';
     return;
   }
-  samples.sort((a,b)=>a-b);
-  const ms=Math.round(samples[Math.floor(samples.length/2)]); // median, less noisy than min/max
+  const ms=Math.round(Math.min(...samples));
   el.textContent=ms+' ms';
   el.style.color=ms<150?'var(--green)':ms<350?'var(--yellow)':'var(--red)';
 }
