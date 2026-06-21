@@ -44,7 +44,6 @@ connections_lock = asyncio.Lock()          # lock for connections
 connection_sockets: dict = {}
 link_ip_map: dict = defaultdict(set)
 SHARE_TOKENS: dict = {}   # token -> {uid, created_at, expires_at, used}
-ORDERS: dict = {}        # order_id -> {label, gb, days, status, uid, created_at}
 stats = {"total_bytes": 0, "total_requests": 0, "total_errors": 0, "start_time": time.time()}
 error_logs: deque = deque(maxlen=50)
 hourly_traffic: dict = defaultdict(int)
@@ -208,353 +207,6 @@ async def telegram_notify(text: str):
     except Exception:
         pass
 
-async def telegram_notify_with_buttons(text: str, buttons: list):
-    """buttons: list of {text, callback_data} rendered as one row of inline buttons."""
-    token, chat_id = CONFIG["tg_token"], CONFIG["tg_chat_id"]
-    if not token or not chat_id:
-        return None
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                json={
-                    "chat_id": chat_id, "text": text, "parse_mode": "HTML",
-                    "reply_markup": {"inline_keyboard": [buttons]},
-                }
-            )
-            return r.json()
-    except Exception:
-        return None
-
-async def telegram_edit_message(chat_id, message_id, text: str):
-    token = CONFIG["tg_token"]
-    if not token:
-        return
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(
-                f"https://api.telegram.org/bot{token}/editMessageText",
-                json={"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML"}
-            )
-    except Exception:
-        pass
-
-async def telegram_answer_callback(callback_id: str, text: str = ""):
-    token = CONFIG["tg_token"]
-    if not token:
-        return
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(
-                f"https://api.telegram.org/bot{token}/answerCallbackQuery",
-                json={"callback_query_id": callback_id, "text": text}
-            )
-    except Exception:
-        pass
-
-ADMIN_STATE: dict = {"awaiting": None}   # simple single-admin conversation state
-
-def _tg_main_menu():
-    return [
-        [{"text": "📋 List Users", "callback_data": "menu:list"}, {"text": "➕ Add User", "callback_data": "menu:add"}],
-        [{"text": "🛒 Pending Orders", "callback_data": "menu:orders"}, {"text": "📊 Stats", "callback_data": "menu:stats"}],
-        [{"text": "🌐 Addresses", "callback_data": "menu:addr"}],
-    ]
-
-async def telegram_send_keyboard(chat_id, text: str, rows: list):
-    token = CONFIG["tg_token"]
-    if not token:
-        return
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML", "reply_markup": {"inline_keyboard": rows}}
-            )
-    except Exception:
-        pass
-
-async def telegram_edit_keyboard(chat_id, message_id, text: str, rows: list):
-    token = CONFIG["tg_token"]
-    if not token:
-        return
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(
-                f"https://api.telegram.org/bot{token}/editMessageText",
-                json={"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML", "reply_markup": {"inline_keyboard": rows}}
-            )
-    except Exception:
-        pass
-
-def _user_detail_text(uid: str, link: dict) -> str:
-    used_str = _fmt_bytes(link["used_bytes"])
-    limit_str = "∞" if link["limit_bytes"] == 0 else _fmt_bytes(link["limit_bytes"])
-    status = "🟢 Active" if link["active"] else "🔴 Inactive"
-    exp = link.get("expires_at")
-    exp_str = "Never" if not exp else exp[:10]
-    return f"<b>{link['label']}</b>\n\n{status}\nData: {used_str} / {limit_str}\nExpires: {exp_str}\nMax devices: {link.get('max_connections') or '∞'}"
-
-def _user_detail_buttons(uid: str, link: dict):
-    toggle_label = "🔴 Turn Off" if link["active"] else "🟢 Turn On"
-    return [
-        [{"text": toggle_label, "callback_data": f"tgl:{uid}"}, {"text": "🔄 Reset Usage", "callback_data": f"rst:{uid}"}],
-        [{"text": "🔗 Share Link", "callback_data": f"shr:{uid}"}, {"text": "🗑 Delete", "callback_data": f"delc:{uid}"}],
-        [{"text": "« Back to list", "callback_data": "menu:list"}],
-    ]
-
-async def _handle_bot_message(chat_id, text: str):
-    text = (text or "").strip()
-    if text in ("/start", "/menu"):
-        ADMIN_STATE["awaiting"] = None
-        await telegram_send_keyboard(chat_id, "👋 <b>Meiteeam Admin Bot</b>\nChoose an action:", _tg_main_menu())
-        return
-    if ADMIN_STATE.get("awaiting") == "add":
-        parts = [p.strip() for p in text.split(",")]
-        if len(parts) < 1 or not parts[0]:
-            await telegram_notify("Format: <code>Label, GB, Days</code> — e.g. <code>John, 50, 30</code>")
-            return
-        label = parts[0][:60]
-        try:
-            gb = float(parts[1]) if len(parts) > 1 and parts[1] else 0
-            days = int(parts[2]) if len(parts) > 2 and parts[2] else 0
-        except ValueError:
-            await telegram_notify("GB and Days must be numbers. Try again: <code>Label, GB, Days</code>")
-            return
-        if not re.match(r'^[a-zA-Z0-9\-_. ]+$', label):
-            await telegram_notify("Label must contain only English letters, numbers, - _ . and spaces.")
-            return
-        order = {"label": label, "gb": gb, "days": days}
-        uid = await _provision_order(order)
-        ADMIN_STATE["awaiting"] = None
-        vless_link = generate_vless_link(uid, remark=f"Meiteeam-{label}")
-        sub_url = f"https://{get_domain()}/sub/{uid}"
-        await telegram_notify(f"✅ Created <b>{label}</b>\n\nSub URL:\n<code>{sub_url}</code>\n\nConfig:\n<code>{vless_link}</code>")
-        await telegram_send_keyboard(chat_id, "What next?", _tg_main_menu())
-        return
-    await telegram_send_keyboard(chat_id, "Not sure what you mean — use the menu below.", _tg_main_menu())
-
-async def _handle_bot_callback(cq: dict):
-    from_id = str(cq.get("from", {}).get("id", ""))
-    cdata = cq.get("data", "")
-    msg = cq.get("message", {})
-    chat_id = msg.get("chat", {}).get("id")
-    message_id = msg.get("message_id")
-    admin_id = CONFIG["tg_chat_id"]
-    if from_id != str(admin_id):
-        await telegram_answer_callback(cq["id"], "Not authorized")
-        return
-    if ":" not in cdata:
-        await telegram_answer_callback(cq["id"])
-        return
-    action, arg = cdata.split(":", 1)
-
-    if action == "menu":
-        await telegram_answer_callback(cq["id"])
-        if arg == "list":
-            async with LINKS_LOCK:
-                items = list(LINKS.items())
-            if not items:
-                await telegram_edit_keyboard(chat_id, message_id, "No users yet.", [[{"text": "« Back", "callback_data": "menu:back"}]])
-                return
-            rows = [[{"text": f"{('🟢' if l['active'] else '🔴')} {l['label']}", "callback_data": f"user:{uid}"}] for uid, l in items[:50]]
-            rows.append([{"text": "« Back", "callback_data": "menu:back"}])
-            await telegram_edit_keyboard(chat_id, message_id, f"<b>Users</b> ({len(items)})", rows)
-        elif arg == "add":
-            ADMIN_STATE["awaiting"] = "add"
-            await telegram_edit_keyboard(chat_id, message_id, "Send the new user as:\n<code>Label, GB, Days</code>\n\ne.g. <code>John, 50, 30</code> (0 = unlimited)", [[{"text": "« Cancel", "callback_data": "menu:back"}]])
-        elif arg == "orders":
-            pending = [(oid, o) for oid, o in ORDERS.items() if o["status"] == "pending"]
-            if not pending:
-                await telegram_edit_keyboard(chat_id, message_id, "No pending orders.", [[{"text": "« Back", "callback_data": "menu:back"}]])
-                return
-            rows = [[{"text": f"🛒 {o['label']} ({o['gb']}GB/{o['days']}d)", "callback_data": f"ord:{oid}"}] for oid, o in pending[:30]]
-            rows.append([{"text": "« Back", "callback_data": "menu:back"}])
-            await telegram_edit_keyboard(chat_id, message_id, f"<b>Pending Orders</b> ({len(pending)})", rows)
-        elif arg == "stats":
-            async with LINKS_LOCK:
-                count = len(LINKS)
-                total_used = sum(l["used_bytes"] for l in LINKS.values())
-            cpu = psutil.cpu_percent(interval=0.1)
-            mem = psutil.virtual_memory().percent
-            text = f"<b>📊 Stats</b>\n\nUsers: {count}\nTotal traffic: {_fmt_bytes(total_used)}\nCPU: {cpu}%\nMemory: {mem}%"
-            await telegram_edit_keyboard(chat_id, message_id, text, [[{"text": "« Back", "callback_data": "menu:back"}]])
-        elif arg == "addr":
-            addrs = "\n".join(f"• {a}" for a in CUSTOM_ADDRESSES) or "No clean IPs configured."
-            await telegram_edit_keyboard(chat_id, message_id, f"<b>🌐 Clean IPs</b>\n\n{addrs}", [[{"text": "« Back", "callback_data": "menu:back"}]])
-        elif arg == "back":
-            ADMIN_STATE["awaiting"] = None
-            await telegram_edit_keyboard(chat_id, message_id, "👋 <b>Meiteeam Admin Bot</b>\nChoose an action:", _tg_main_menu())
-        return
-
-    if action == "user":
-        await telegram_answer_callback(cq["id"])
-        async with LINKS_LOCK:
-            link = LINKS.get(arg)
-        if not link:
-            await telegram_edit_keyboard(chat_id, message_id, "User not found.", [[{"text": "« Back", "callback_data": "menu:list"}]])
-            return
-        await telegram_edit_keyboard(chat_id, message_id, _user_detail_text(arg, link), _user_detail_buttons(arg, link))
-        return
-
-    if action == "tgl":
-        async with LINKS_LOCK:
-            link = LINKS.get(arg)
-            if link:
-                link["active"] = not link["active"]
-                link_copy = dict(link)
-        if link:
-            await db_save_link(arg, link_copy)
-            await telegram_answer_callback(cq["id"], "Toggled")
-            await telegram_edit_keyboard(chat_id, message_id, _user_detail_text(arg, link_copy), _user_detail_buttons(arg, link_copy))
-        else:
-            await telegram_answer_callback(cq["id"], "Not found")
-        return
-
-    if action == "rst":
-        async with LINKS_LOCK:
-            link = LINKS.get(arg)
-            if link:
-                link["used_bytes"] = 0
-                link["notified_quota"] = False
-                link_copy = dict(link)
-        if link:
-            await db_save_link(arg, link_copy)
-            await telegram_answer_callback(cq["id"], "Usage reset")
-            await telegram_edit_keyboard(chat_id, message_id, _user_detail_text(arg, link_copy), _user_detail_buttons(arg, link_copy))
-        else:
-            await telegram_answer_callback(cq["id"], "Not found")
-        return
-
-    if action == "shr":
-        async with LINKS_LOCK:
-            exists = arg in LINKS
-        if not exists:
-            await telegram_answer_callback(cq["id"], "Not found")
-            return
-        for tok, info in list(SHARE_TOKENS.items()):
-            if info["expires_at"] < time.time():
-                SHARE_TOKENS.pop(tok, None)
-        token = secrets.token_urlsafe(24)
-        SHARE_TOKENS[token] = {"uid": arg, "created_at": time.time(), "expires_at": time.time() + 86400, "used": False}
-        await telegram_answer_callback(cq["id"], "Link sent below")
-        await telegram_notify(f"🔗 One-time share link for <b>{arg}</b>:\nhttps://{get_domain()}/share/{token}")
-        return
-
-    if action == "delc":
-        await telegram_answer_callback(cq["id"])
-        await telegram_edit_keyboard(chat_id, message_id, f"Delete <b>{arg}</b>? This cannot be undone.", [
-            [{"text": "✅ Yes, delete", "callback_data": f"delx:{arg}"}, {"text": "« Cancel", "callback_data": f"user:{arg}"}],
-        ])
-        return
-
-    if action == "delx":
-        async with LINKS_LOCK:
-            LINKS.pop(arg, None)
-        await close_connections_for_link(arg)
-        await db_delete_link(arg)
-        await telegram_answer_callback(cq["id"], "Deleted")
-        await telegram_edit_keyboard(chat_id, message_id, f"🗑 Deleted <b>{arg}</b>.", [[{"text": "« Back to list", "callback_data": "menu:list"}]])
-        return
-
-    if action == "ord":
-        order = ORDERS.get(arg)
-        if not order or order["status"] != "pending":
-            await telegram_answer_callback(cq["id"], "Not available")
-            return
-        await telegram_answer_callback(cq["id"])
-        gb_str = "Unlimited" if order["gb"] <= 0 else f"{order['gb']}GB"
-        days_str = "No expiry" if order["days"] <= 0 else f"{order['days']} days"
-        text = f"🛒 <b>{order['label']}</b>\n{gb_str} / {days_str}"
-        if order.get("note"):
-            text += f"\nNote: {order['note']}"
-        await telegram_edit_keyboard(chat_id, message_id, text, [
-            [{"text": "✅ Approve", "callback_data": f"appr:{arg}"}, {"text": "❌ Reject", "callback_data": f"rej:{arg}"}],
-            [{"text": "« Back", "callback_data": "menu:orders"}],
-        ])
-        return
-
-    if action in ("appr", "rej"):
-        order_id = arg
-        order = ORDERS.get(order_id)
-        if order is None:
-            await telegram_answer_callback(cq["id"], "Order not found")
-            return
-        if order["status"] != "pending":
-            await telegram_answer_callback(cq["id"], "Already handled")
-            return
-        if action == "appr":
-            uid = await _provision_order(order)
-            order["status"] = "approved"
-            order["uid"] = uid
-            await telegram_answer_callback(cq["id"], "Approved ✅")
-            await telegram_edit_keyboard(chat_id, message_id, f"✅ Approved — <b>{order['label']}</b> ({order['gb']}GB / {order['days']}d) is live.", [[{"text": "« Menu", "callback_data": "menu:back"}]])
-        else:
-            order["status"] = "rejected"
-            await telegram_answer_callback(cq["id"], "Rejected ❌")
-            await telegram_edit_keyboard(chat_id, message_id, f"❌ Rejected — <b>{order['label']}</b> request.", [[{"text": "« Menu", "callback_data": "menu:back"}]])
-        return
-
-    await telegram_answer_callback(cq["id"])
-
-async def order_telegram_poller():
-    """Long-polls Telegram for the admin bot menu, user management buttons, and order approvals."""
-    offset = 0
-    while True:
-        token, admin_id = CONFIG["tg_token"], CONFIG["tg_chat_id"]
-        if not token or not admin_id:
-            await asyncio.sleep(10)
-            continue
-        try:
-            async with httpx.AsyncClient(timeout=35.0) as client:
-                r = await client.get(
-                    f"https://api.telegram.org/bot{token}/getUpdates",
-                    params={"offset": offset, "timeout": 25, "allowed_updates": '["callback_query","message"]'}
-                )
-                data = r.json()
-        except Exception:
-            await asyncio.sleep(5)
-            continue
-        for update in data.get("result", []):
-            offset = update["update_id"] + 1
-            cq = update.get("callback_query")
-            if cq:
-                try:
-                    await _handle_bot_callback(cq)
-                except Exception:
-                    logger.exception("telegram callback handling failed")
-                continue
-            msg = update.get("message")
-            if msg:
-                from_id = str(msg.get("from", {}).get("id", ""))
-                if from_id != str(admin_id):
-                    continue
-                try:
-                    await _handle_bot_message(msg.get("chat", {}).get("id"), msg.get("text", ""))
-                except Exception:
-                    logger.exception("telegram message handling failed")
-
-async def _provision_order(order: dict) -> str:
-    """Creates the actual inbound for an approved order. Returns the uid."""
-    label = order["label"]
-    async with LINKS_LOCK:
-        uid = label
-        n = 2
-        while uid in LINKS:
-            uid = f"{label}-{n}"
-            n += 1
-        limit_bytes = 0 if order["gb"] <= 0 else parse_size_to_bytes(order["gb"], "GB")
-        expires_at = None
-        if order["days"] > 0:
-            expires_at = (datetime.now(timezone.utc) + timedelta(days=order["days"])).isoformat()
-        LINKS[uid] = {
-            "label": uid, "limit_bytes": limit_bytes, "used_bytes": 0,
-            "max_connections": 0, "created_at": datetime.now(timezone.utc).isoformat(),
-            "active": True, "expires_at": expires_at, "group_id": None,
-        }
-    await db_save_link(uid, LINKS[uid])
-    return uid
-
 async def quota_expiry_watcher():
     """Checks every 5 minutes for links nearing quota/expiry and sends a one-time Telegram alert."""
     while True:
@@ -692,7 +344,6 @@ async def startup():
     asyncio.create_task(keep_alive())
     asyncio.create_task(flush_usage_to_db())
     asyncio.create_task(quota_expiry_watcher())
-    asyncio.create_task(order_telegram_poller())
     await ensure_default_link()
 
 @app.on_event("shutdown")
@@ -784,10 +435,62 @@ def get_client_ip(websocket: WebSocket) -> str:
         return websocket.client.host
     return "unknown"
 
+# Recognize common VLESS/V2Ray client apps + OS platform from the WebSocket
+# handshake's User-Agent header. Best-effort only — clients can send anything.
+_DEVICE_APP_PATTERNS = [
+    (re.compile(r'v2rayNG', re.I), "v2rayNG"),
+    (re.compile(r'v2rayN\b', re.I), "v2rayN"),
+    (re.compile(r'Shadowrocket', re.I), "Shadowrocket"),
+    (re.compile(r'Streisand', re.I), "Streisand"),
+    (re.compile(r'Stash', re.I), "Stash"),
+    (re.compile(r'Clash[\s\-]?Meta', re.I), "Clash Meta"),
+    (re.compile(r'ClashX', re.I), "ClashX"),
+    (re.compile(r'Clash', re.I), "Clash"),
+    (re.compile(r'NekoBox|NekoRay', re.I), "NekoBox"),
+    (re.compile(r'Hiddify', re.I), "Hiddify"),
+    (re.compile(r'FairVPN|FairVPN', re.I), "FairVPN"),
+    (re.compile(r'Sing-?[Bb]ox|SFA|SFI|SFM|SFT', re.I), "sing-box"),
+    (re.compile(r'Loon', re.I), "Loon"),
+    (re.compile(r'Quantumult', re.I), "Quantumult"),
+    (re.compile(r'Surge', re.I), "Surge"),
+]
+_DEVICE_OS_PATTERNS = [
+    (re.compile(r'Android', re.I), "Android"),
+    (re.compile(r'iPhone|iPad|iOS|CFNetwork', re.I), "iOS"),
+    (re.compile(r'Windows', re.I), "Windows"),
+    (re.compile(r'Mac ?OS|Macintosh|Darwin', re.I), "macOS"),
+    (re.compile(r'Linux', re.I), "Linux"),
+]
+
+def parse_user_agent(ua: str) -> str | None:
+    """Returns a short human label like 'v2rayNG · Android', or just the OS / app
+    alone if only one is detected. Returns None if nothing recognizable is found."""
+    if not ua:
+        return None
+    app = next((label for pattern, label in _DEVICE_APP_PATTERNS if pattern.search(ua)), None)
+    os_name = next((label for pattern, label in _DEVICE_OS_PATTERNS if pattern.search(ua)), None)
+    if app and os_name:
+        return f"{app} · {os_name}"
+    if app:
+        return app
+    if os_name:
+        return os_name
+    return None
+
 # lock used here
 async def count_connections_for_link(uid: str) -> int:
     async with connections_lock:
         return sum(1 for info in connections.values() if info.get("uuid") == uid)
+
+async def current_device_label_for_link(uid: str) -> str | None:
+    """Returns the device/app label of the most recently connected active
+    session for this link, or None if no connection is currently open."""
+    async with connections_lock:
+        matches = [info for info in connections.values() if info.get("uuid") == uid]
+    if not matches:
+        return None
+    latest = max(matches, key=lambda info: info.get("connected_at") or "")
+    return latest.get("device_label")
 
 async def remove_ip_from_link(uid: str, ip: str):
     async with connections_lock:
@@ -1107,6 +810,7 @@ async def list_links(_=Depends(require_auth)):
             "created_at": data["created_at"],
             "expires_at": data.get("expires_at"),
             "current_connections": await count_connections_for_link(uid),  # FIX: await
+            "device_label": await current_device_label_for_link(uid),
             "vless_link": generate_vless_link(uid, remark=f"meiteeam-{data['label']}"),
             "group_id": gid,
             "group_name": group_names.get(gid) if gid else None,
@@ -1447,138 +1151,6 @@ async def create_share_link(uid: str, _=Depends(require_auth)):
     SHARE_TOKENS[token] = {"uid": uid, "created_at": time.time(), "expires_at": time.time() + 86400, "used": False}
     return {"ok": True, "share_url": f"https://{get_domain()}/share/{token}"}
 
-@app.post("/order/api/submit")
-async def submit_order(request: Request):
-    body = await request.json()
-    label = (body.get("label") or "").strip()[:40]
-    if not label or not re.match(r'^[a-zA-Z0-9\-_. ]+$', label):
-        raise HTTPException(status_code=400, detail="Name must contain only English letters, numbers, and characters: - _ . space")
-    try:
-        gb = float(body.get("gb") or 0)
-        days = int(body.get("days") or 0)
-    except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid traffic or duration value")
-    if gb < 0 or gb > 10000 or days < 0 or days > 3650:
-        raise HTTPException(status_code=400, detail="Value out of allowed range")
-    note = (body.get("note") or "").strip()[:200]
-    order_id = secrets.token_urlsafe(10)
-    ORDERS[order_id] = {
-        "label": label, "gb": gb, "days": days, "note": note,
-        "status": "pending", "uid": None, "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    gb_str = "Unlimited" if gb <= 0 else f"{gb}GB"
-    days_str = "No expiry" if days <= 0 else f"{days} days"
-    text = f"🛒 <b>New order request</b>\n\n<b>Name:</b> {label}\n<b>Traffic:</b> {gb_str}\n<b>Duration:</b> {days_str}"
-    if note:
-        text += f"\n<b>Note:</b> {note}"
-    await telegram_notify_with_buttons(text, [
-        {"text": "✅ Approve", "callback_data": f"appr:{order_id}"},
-        {"text": "❌ Reject", "callback_data": f"rej:{order_id}"},
-    ])
-    return {"ok": True, "order_id": order_id}
-
-@app.get("/order/api/status/{order_id}")
-async def order_status(order_id: str):
-    order = ORDERS.get(order_id)
-    if order is None:
-        raise HTTPException(status_code=404, detail="Order not found")
-    out = {"status": order["status"], "label": order["label"]}
-    if order["status"] == "approved" and order["uid"]:
-        uid = order["uid"]
-        async with LINKS_LOCK:
-            link = LINKS.get(uid)
-        if link:
-            out["vless_link"] = generate_vless_link(uid, remark=f"Meiteeam-{link['label']}")
-            out["sub_url"] = f"https://{get_domain()}/sub/{uid}"
-    return out
-
-@app.get("/order", response_class=HTMLResponse)
-async def order_page():
-    body = """
-        <div class="mono">M</div>
-        <h1>Request a Config</h1>
-        <p>Fill in what you need below. An admin will review and approve your request shortly.</p>
-        <div style="margin-top:18px">
-          <label style="font-size:10.5px;color:var(--text3);text-transform:uppercase;letter-spacing:.06em">Your Name</label>
-          <input id="o-label" type="text" placeholder="e.g. John" style="width:100%;margin-top:5px;padding:10px 12px;background:var(--surface3);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:inherit;font-size:13px">
-        </div>
-        <div style="margin-top:14px;display:flex;gap:10px">
-          <div style="flex:1">
-            <label style="font-size:10.5px;color:var(--text3);text-transform:uppercase;letter-spacing:.06em">Traffic (GB)</label>
-            <input id="o-gb" type="number" min="0" step=".5" placeholder="0 = unlimited" style="width:100%;margin-top:5px;padding:10px 12px;background:var(--surface3);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:inherit;font-size:13px">
-          </div>
-          <div style="flex:1">
-            <label style="font-size:10.5px;color:var(--text3);text-transform:uppercase;letter-spacing:.06em">Duration (days)</label>
-            <input id="o-days" type="number" min="0" placeholder="0 = unlimited" style="width:100%;margin-top:5px;padding:10px 12px;background:var(--surface3);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:inherit;font-size:13px">
-          </div>
-        </div>
-        <div style="margin-top:14px">
-          <label style="font-size:10.5px;color:var(--text3);text-transform:uppercase;letter-spacing:.06em">Note (optional)</label>
-          <input id="o-note" type="text" placeholder="Anything the admin should know" style="width:100%;margin-top:5px;padding:10px 12px;background:var(--surface3);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:inherit;font-size:13px">
-        </div>
-        <button class="copybtn" id="o-submit" onclick="submitOrder()">Submit Request</button>
-        <div id="o-err" style="color:var(--red);font-size:12px;margin-top:10px;display:none"></div>
-    """
-    html = _public_page("Request a Config", body)
-    html = html.replace("</script>", """
-async function submitOrder(){
-  const btn=document.getElementById('o-submit');
-  const err=document.getElementById('o-err');
-  err.style.display='none';
-  const label=document.getElementById('o-label').value.trim();
-  const gb=document.getElementById('o-gb').value||0;
-  const days=document.getElementById('o-days').value||0;
-  const note=document.getElementById('o-note').value.trim();
-  if(!label){err.textContent='Please enter your name.';err.style.display='block';return;}
-  btn.disabled=true;btn.textContent='Submitting...';
-  try{
-    const r=await fetch('/order/api/submit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label,gb,days,note})});
-    const d=await r.json();
-    if(!r.ok)throw new Error(d.detail||'Error submitting request');
-    location.href='/order/status/'+d.order_id;
-  }catch(e){
-    err.textContent=e.message||'Error submitting request';
-    err.style.display='block';
-    btn.disabled=false;btn.textContent='Submit Request';
-  }
-}
-</script>""")
-    return HTMLResponse(html)
-
-@app.get("/order/status/{order_id}", response_class=HTMLResponse)
-async def order_status_page(order_id: str):
-    order = ORDERS.get(order_id)
-    if order is None:
-        return HTMLResponse(_public_page("Not Found", '<div class="mono">!</div><h1>Order not found</h1><p>This request does not exist or has expired.</p>'), status_code=404)
-    if order["status"] == "pending":
-        body = f"""
-            <div class="mono">M</div>
-            <h1>{order['label']}</h1>
-            <p>Your request is waiting for admin approval. This page refreshes automatically — keep it open.</p>
-            <div class="row"><span>Status</span><span class="tag" style="color:var(--yellow)">Pending</span></div>
-        """
-        html = _public_page("Order Pending", body)
-        html = html.replace("</script>", "setTimeout(()=>location.reload(),5000);\n</script>")
-        return HTMLResponse(html)
-    if order["status"] == "rejected":
-        return HTMLResponse(_public_page("Request Rejected", f'<div class="mono">!</div><h1>{order["label"]}</h1><p>Your request was not approved. Please contact the admin for details.</p>'))
-    uid = order["uid"]
-    async with LINKS_LOCK:
-        link = LINKS.get(uid) if uid else None
-    if link is None:
-        return HTMLResponse(_public_page("Not Found", '<div class="mono">!</div><h1>Config not found</h1><p>This inbound no longer exists.</p>'))
-    vless_link = generate_vless_link(uid, remark=f"Meiteeam-{link['label']}")
-    sub_url = f"https://{get_domain()}/sub/{uid}"
-    body = f"""
-        <div class="mono">M</div>
-        <h1>{link['label']}</h1>
-        <p>Your request was approved! Save your config below.</p>
-        <div class="qr-box"><img src="https://api.qrserver.com/v1/create-qr-code/?size=240x240&data={quote(sub_url)}" alt="QR"></div>
-        <textarea id="cfgtxt" rows="3" readonly>{vless_link}</textarea>
-        <button class="copybtn" id="cpbtn" onclick="cp()">Copy Config</button>
-    """
-    return HTMLResponse(_public_page(f"{link['label']} · Approved", body))
-
 @app.get("/share/{token}", response_class=HTMLResponse)
 async def view_share_link(token: str):
     info = SHARE_TOKENS.get(token)
@@ -1851,11 +1423,13 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
             return
 
         conn_id = secrets.token_urlsafe(8)
+        device_label = parse_user_agent(websocket.headers.get("user-agent", ""))
         async with connections_lock:
             connections[conn_id] = {
                 "uuid": uuid, "ip": client_ip,
                 "connected_at": datetime.now(timezone.utc).isoformat(),
                 "bytes": 0,
+                "device_label": device_label,
             }
             connection_sockets[conn_id] = websocket
             link_ip_map[uuid].add(client_ip)
@@ -2324,10 +1898,7 @@ body{font-family:'Inter',sans-serif;color:var(--text);display:flex;flex-directio
         <div class="page-eyebrow">Routing</div>
         <div class="page-header-row">
           <div><div class="page-title">Clean IP</div><div class="page-sub">Subscription alternative addresses</div></div>
-          <div style="display:flex;gap:8px">
-            <button class="btn btn-ghost" onclick="pingAllAddrs()">⚡ Ping All</button>
-            <button class="btn btn-gold" onclick="showAddAddrMo()">+ Add</button>
-          </div>
+          <button class="btn btn-gold" onclick="showAddAddrMo()">+ Add</button>
         </div>
         <div class="page-rule"></div>
       </div>
@@ -2658,7 +2229,7 @@ function renderLinks(links){
 
   tb.innerHTML=rows.map(r=>`<tr>
     <td style="color:var(--text3);font-size:10.5px">${r.i}</td>
-    <td style="font-weight:600">${esc(r.l.label)}${r.l.group_name?`<span class="tag" style="background:var(--purple-dim);color:var(--purple);margin-left:6px;font-size:9px">${esc(r.l.group_name)}</span>`:''}</td>
+    <td style="font-weight:600">${esc(r.l.label)}${r.l.group_name?`<span class="tag" style="background:var(--purple-dim);color:var(--purple);margin-left:6px;font-size:9px">${esc(r.l.group_name)}</span>`:''}${r.l.device_label?`<span class="tag" style="background:var(--green-dim);color:var(--green);margin-left:6px;font-size:9px">● ${esc(r.l.device_label)}</span>`:''}</td>
     <td><span class="tag tag-vless">VLESS</span></td>
     <td><div class="pill"><span class="pill-used">${fmtB(r.u)}</span><div class="pill-bar"><div class="pill-fill" style="width:${r.pct}%;background:${r.col}"></div></div><span class="pill-lim">${fmtLim(r.lim)}</span></div></td>
     <td style="font-size:11px;font-weight:600;color:${r.mc2>0&&r.cc>=r.mc2?'var(--red)':'var(--text2)'}">${r.cc}/${r.mc2||'∞'}</td>
@@ -2683,6 +2254,7 @@ function renderLinks(links){
         <span style="font-weight:600;font-size:14px">${esc(r.l.label)}</span>
         <span class="tag tag-vless">VLESS</span>
         ${r.l.group_name?`<span class="tag" style="background:var(--purple-dim);color:var(--purple)">${esc(r.l.group_name)}</span>`:''}
+        ${r.l.device_label?`<span class="tag" style="background:var(--green-dim);color:var(--green)">● ${esc(r.l.device_label)}</span>`:''}
       </div>
       <button class="toggle ${r.l.active?'on':''}" data-uid="${r.l.uuid}" onclick="togLink(this)"></button>
     </div>
@@ -3088,40 +2660,8 @@ function renderAddrs(){
       <span style="color:var(--accent);font-size:16px">🌐</span>
       <div><div style="font-size:14px;font-weight:600">${esc(a)}</div><div style="font-size:11px;color:var(--text3);margin-top:2px;">Address #${i+1}</div></div>
     </div>
-    <div style="display:flex;align-items:center;gap:8px">
-      <span id="ping-${i}" style="font-family:'JetBrains Mono',monospace;font-size:11.5px;font-weight:600;color:var(--text3);min-width:58px;text-align:right">–</span>
-      <button class="act-btn act-copy" onclick="pingAddr('${esc(a)}',${i})">Ping</button>
-      <button class="act-btn act-del" onclick="delAddr(${i})">Del</button>
-    </div>
+    <button class="act-btn act-del" onclick="delAddr(${i})">Del</button>
   </div>`).join('');
-  allAddrs.forEach((a,i)=>pingAddr(a,i));
-}
-
-async function pingAddr(host,i){
-  const el=$m('ping-'+i);
-  if(!el)return;
-  el.textContent='…';
-  el.style.color='var(--text3)';
-  const samples=[];
-  for(let n=0;n<3;n++){
-    const t0=performance.now();
-    try{
-      await fetch('https://'+host+'/favicon.ico?_='+Date.now(),{mode:'no-cors',cache:'no-store'});
-      samples.push(performance.now()-t0);
-    }catch(e){/* opaque/blocked responses still resolve the timing in most cases */}
-  }
-  if(!samples.length){
-    el.textContent='timeout';
-    el.style.color='var(--red)';
-    return;
-  }
-  const ms=Math.round(Math.min(...samples));
-  el.textContent=ms+' ms';
-  el.style.color=ms<150?'var(--green)':ms<350?'var(--yellow)':'var(--red)';
-}
-
-async function pingAllAddrs(){
-  allAddrs.forEach((a,i)=>pingAddr(a,i));
 }
 
 function showAddAddrMo(){$m('na').value='';$m('mo-addr').classList.add('show');}
