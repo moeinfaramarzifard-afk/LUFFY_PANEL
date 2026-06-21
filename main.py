@@ -19,14 +19,14 @@ import psutil
 import sqlite3
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("Luffy-Gateway")
+logger = logging.getLogger("meiteeam-Gateway")
 
-app = FastAPI(title="Luffy Panel", docs_url=None, redoc_url=None)
+app = FastAPI(title="meiteeam Panel", docs_url=None, redoc_url=None)
 
 CONFIG = {
     "port": int(os.environ.get("PORT", 8000)),
     "secret": os.environ.get("SECRET_KEY", secrets.token_urlsafe(32)),
-    "db_path": os.environ.get("DB_PATH", "luffy.db"),
+    "db_path": os.environ.get("DB_PATH", "meiteeam.db"),
     "tg_token": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
     "tg_chat_id": os.environ.get("TELEGRAM_CHAT_ID", ""),
 }
@@ -293,7 +293,7 @@ def generate_uuid(seed: str | None = None) -> str:
     h = hashlib.sha256(f"{seed}{CONFIG['secret']}".encode()).hexdigest()
     return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
 
-def generate_vless_link(uuid: str, remark: str = "Luffy", address: str = None) -> str:
+def generate_vless_link(uuid: str, remark: str = "meiteeam", address: str = None) -> str:
     domain = get_domain()
     addr = address if address else domain
     path = f"/ws/{uuid}"
@@ -391,7 +391,7 @@ async def close_connections_for_link(uid: str):
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"service": "Luffy Panel", "version": "1.0", "status": "active", "domain": get_domain()}
+    return {"service": "meiteeam Panel", "version": "1.0", "status": "active", "domain": get_domain()}
 
 @app.get("/health")
 async def health():
@@ -527,7 +527,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
     return {
         "uuid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
         "max_connections": max_conn, "active": True, "created_at": LINKS[uid]["created_at"],
-        "expires_at": expires_at, "vless_link": generate_vless_link(uid, remark=f"Luffy-{label}"),
+        "expires_at": expires_at, "vless_link": generate_vless_link(uid, remark=f"meiteeam-{label}"),
     }
 
 @app.post("/api/links/bulk")
@@ -592,7 +592,7 @@ async def list_links(_=Depends(require_auth)):
             "created_at": data["created_at"],
             "expires_at": data.get("expires_at"),
             "current_connections": await count_connections_for_link(uid),  # FIX: await
-            "vless_link": generate_vless_link(uid, remark=f"Luffy-{data['label']}"),
+            "vless_link": generate_vless_link(uid, remark=f"meiteeam-{data['label']}"),
         })
     result.sort(key=lambda x: x["created_at"], reverse=True)
     return {"links": result}
@@ -669,39 +669,6 @@ async def delete_address(index: int, _=Depends(require_auth)):
     await db_delete_address(removed)
     return {"ok": True, "addresses": list(CUSTOM_ADDRESSES)}
 
-PING_TIMEOUT_SECONDS = 8.0
-
-async def _https_ping(address: str) -> dict:
-    """Measure real-world HTTPS latency to an address: full DNS + TCP + TLS
-    handshake + time-to-first-byte of an HTTP HEAD request. This is closer to
-    what a client actually experiences than a bare TCP SYN/ACK, which can
-    return misleadingly fast if something near the server (a load balancer,
-    firewall, or edge node) answers the handshake without reaching the
-    real backend."""
-    url = f"https://{address}/"
-    start = time.monotonic()
-    try:
-        async with httpx.AsyncClient(timeout=PING_TIMEOUT_SECONDS, verify=False) as client:
-            await client.head(url, follow_redirects=True)
-        elapsed_ms = round((time.monotonic() - start) * 1000)
-        return {"address": address, "ok": True, "ms": elapsed_ms}
-    except httpx.TimeoutException:
-        return {"address": address, "ok": False, "error": "timeout"}
-    except httpx.HTTPError as exc:
-        return {"address": address, "ok": False, "error": str(exc) or "connection failed"}
-    except Exception as exc:
-        return {"address": address, "ok": False, "error": str(exc) or "failed"}
-
-@app.post("/api/addresses/ping")
-async def ping_addresses(_=Depends(require_auth)):
-    """Test real HTTPS latency (DNS + TCP + TLS + TTFB) for every saved custom address, in parallel."""
-    async with CUSTOM_ADDRESSES_LOCK:
-        addresses = list(CUSTOM_ADDRESSES)
-    if not addresses:
-        return {"results": []}
-    results = await asyncio.gather(*(_https_ping(addr) for addr in addresses))
-    return {"results": results}
-
 @app.get("/api/backup")
 async def export_backup(_=Depends(require_auth)):
     """Full JSON export of inbounds + addresses, downloadable for safekeeping."""
@@ -714,7 +681,7 @@ async def export_backup(_=Depends(require_auth)):
         "links": links_snapshot,
         "addresses": addresses_snapshot,
     }
-    headers = {"Content-Disposition": f'attachment; filename="luffy-backup-{int(time.time())}.json"'}
+    headers = {"Content-Disposition": f'attachment; filename="meiteeam-backup-{int(time.time())}.json"'}
     return JSONResponse(content=payload, headers=headers)
 
 @app.post("/api/restore")
@@ -775,14 +742,14 @@ async def get_subscription(uid: str, _=Depends(require_auth)):
         if link is None:
             raise HTTPException(status_code=404, detail="link not found")
         link = dict(link)
-    vless_link = generate_vless_link(uid, remark=f"Luffy-{link['label']}")
+    vless_link = generate_vless_link(uid, remark=f"meiteeam-{link['label']}")
     used = link["used_bytes"]
     limit = link["limit_bytes"]
     used_mb = round(used / (1024 * 1024), 2)
     limit_mb = round(limit / (1024 * 1024), 2) if limit > 0 else 0
     pct = round((used / limit) * 100, 1) if limit > 0 else 0
     remaining_mb = round((limit - used) / (1024 * 1024), 2) if limit > 0 else 0
-    sub_content = f"# Luffy Panel\n{vless_link}"
+    sub_content = f"# meiteeam Panel\n{vless_link}"
     encoded = base64.b64encode(sub_content.encode()).decode()
     return {
         "subscription_url": f"{get_domain()}/api/links/{uid}/sub",
@@ -811,9 +778,9 @@ def generate_subscription_content(link: dict, uid: str, addresses: list[str]) ->
     else:
         expiry_str = f"{secs_left // 86400} Days Left"
     status_node = generate_vless_link(uid, remark=f"📊 {usage_str} | ⏳ {expiry_str}", address="0.0.0.0")
-    links_out = [status_node, generate_vless_link(uid, remark=f"Luffy-{link['label']}-Server")]
+    links_out = [status_node, generate_vless_link(uid, remark=f"meiteeam-{link['label']}-Server")]
     for i, addr in enumerate(addresses):
-        links_out.append(generate_vless_link(uid, remark=f"Luffy-{link['label']}-IP{i+1}", address=addr))
+        links_out.append(generate_vless_link(uid, remark=f"meiteeam-{link['label']}-IP{i+1}", address=addr))
     return "\n".join(links_out)
 
 @app.get("/sub/{uid}")
@@ -910,16 +877,16 @@ async def view_share_link(token: str):
         if link is None:
             return HTMLResponse(_public_page("Not Found", '<div class="mono">!</div><h1>Config not found</h1><p>This inbound no longer exists.</p>'))
         link = dict(link)
-    vless_link = generate_vless_link(uid, remark=f"Luffy-{link['label']}")
+    sub_url = f"https://{get_domain()}/sub/{uid}"
     body = f"""
-        <div class="mono">L</div>
+        <div class="mono">M</div>
         <h1>{link['label']}</h1>
-        <p>Save this config now — this link cannot be opened again.</p>
-        <div class="qr-box"><img src="https://api.qrserver.com/v1/create-qr-code/?size=240x240&data={quote(vless_link)}" alt="QR"></div>
-        <textarea id="cfgtxt" rows="3" readonly>{vless_link}</textarea>
-        <button class="copybtn" id="cpbtn" onclick="cp()">Copy Config</button>
+        <p>Save this subscription link now — this link cannot be opened again.</p>
+        <div class="qr-box"><img src="https://api.qrserver.com/v1/create-qr-code/?size=240x240&data={quote(sub_url)}" alt="QR"></div>
+        <textarea id="cfgtxt" rows="3" readonly>{sub_url}</textarea>
+        <button class="copybtn" id="cpbtn" onclick="cp()">Copy Subscription Link</button>
     """
-    return HTMLResponse(_public_page(f"{link['label']} · Config", body))
+    return HTMLResponse(_public_page(f"{link['label']} · Subscription", body))
 
 # ── Public client self-status page ─────────────────────────────────────────────
 @app.get("/status/{uid}", response_class=HTMLResponse)
@@ -945,7 +912,7 @@ async def client_status_page(uid: str):
     status_tag = f'<span class="tag" style="background:var(--green-dim);color:var(--green)">Active</span>' if active else f'<span class="tag" style="background:var(--red-dim);color:var(--red)">Inactive</span>'
     bar = "" if limit == 0 else f'<div class="pill-bar"><div class="pill-fill" style="width:{pct}%;background:{color}"></div></div>'
     body = f"""
-        <div class="mono">L</div>
+        <div class="mono">M</div>
         <h1>{link['label']}</h1>
         <p>Your personal usage status. This page only shows your own connection — nothing else.</p>
         <div class="row"><span>Status</span>{status_tag}</div>
@@ -1205,7 +1172,7 @@ PANEL_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>Luffy Panel</title>
+<title>meiteeam Panel</title>
 <link href="https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700;800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <style>
@@ -1401,8 +1368,8 @@ body{font-family:'Inter',sans-serif;color:var(--text);display:flex;flex-directio
   <div class="login-wrap">
     <div class="login-box">
       <div class="login-logo">
-        <div class="sb-hat" style="width:44px;height:44px;border-radius:13px;font-size:19px">L</div>
-        <div class="login-title">Luffy Panel</div>
+        <div class="sb-hat" style="width:44px;height:44px;border-radius:13px;font-size:19px">M</div>
+        <div class="login-title">meiteeam Panel</div>
         <div class="login-sub">Enter your password to continue</div>
       </div>
       <div class="fg">
@@ -1423,14 +1390,14 @@ body{font-family:'Inter',sans-serif;color:var(--text);display:flex;flex-directio
     <div class="mob-tl-group">
       <button class="theme-toggle" onclick="toggleTheme()" id="theme-btn-mob">🌙</button>
     </div>
-    <span style="font-family:'Sora',sans-serif;font-size:15px;font-weight:700;color:var(--text);letter-spacing:-.01em;">Luffy Panel</span>
+    <span style="font-family:'Sora',sans-serif;font-size:15px;font-weight:700;color:var(--text);letter-spacing:-.01em;">meiteeam Panel</span>
   </div>
 
   <!-- SIDEBAR / BOTTOM NAV -->
   <aside class="sidebar" id="sb">
     <div class="sb-brand">
-      <div class="sb-hat">L</div>
-      <div class="sb-title">Luffy Panel</div>
+      <div class="sb-hat">M</div>
+      <div class="sb-title">meiteeam Panel</div>
     </div>
     <nav class="sb-nav">
       <button class="nav-item active" data-page="dashboard">
@@ -1561,10 +1528,7 @@ body{font-family:'Inter',sans-serif;color:var(--text);display:flex;flex-directio
     <section class="page" id="page-addresses">
       <div class="page-header">
         <div><div class="page-title">Clean IP</div><div class="page-sub">Subscription alternative addresses</div></div>
-        <div style="display:flex;gap:8px">
-          <button class="btn btn-ghost" id="ping-btn" onclick="pingAddrs()">⚡ Test Speed</button>
-          <button class="btn btn-gold" onclick="showAddAddrMo()">+ Add</button>
-        </div>
+        <button class="btn btn-gold" onclick="showAddAddrMo()">+ Add</button>
       </div>
       <div class="card">
         <div style="font-size:12px;color:var(--text3);margin-bottom:12px">Default: www.speedtest.net</div>
@@ -1677,7 +1641,6 @@ let cf='all';
 let sData={};
 let tChart=null;
 let allAddrs=[];
-let pingResults={};
 let isAuthenticated=false;
 
 // ── Theme ────────────────────────────────────────────────────────────────────
@@ -1855,7 +1818,7 @@ function renderLinks(links){
       <button class="act-btn act-edit" onclick="showEditMo('${r.l.uuid}')">${editText}</button>
       <button class="act-btn act-copy" onclick="cpLink('${esc(r.l.vless_link||'')}')">${copyText}</button>
       <button class="act-btn act-sub" onclick="cpSub('${r.l.uuid}')">${subText}</button>
-      <button class="act-btn act-qr" onclick="showQR('${esc(r.l.vless_link||'')}')">${qrText}</button>
+      <button class="act-btn act-qr" onclick="showQR('https://'+location.host+'/sub/'+'${r.l.uuid}')">${qrText}</button>
       <button class="act-btn act-sub" style="background:var(--purple-dim);color:var(--purple)" onclick="shareLink('${r.l.uuid}')">${shareText}</button>
       <button class="act-btn act-copy" onclick="cpStatus('${r.l.uuid}')">${statusText}</button>
       <button class="act-btn act-del" onclick="delLink('${r.l.uuid}')">${delText}</button>
@@ -1877,7 +1840,7 @@ function renderLinks(links){
       <button class="act-btn act-edit" onclick="showEditMo('${r.l.uuid}')">${editText}</button>
       <button class="act-btn act-copy" onclick="cpLink('${esc(r.l.vless_link||'')}')">${copyText}</button>
       <button class="act-btn act-sub" onclick="cpSub('${r.l.uuid}')">${subText}</button>
-      <button class="act-btn act-qr" onclick="showQR('${esc(r.l.vless_link||'')}')">${qrText}</button>
+      <button class="act-btn act-qr" onclick="showQR('https://'+location.host+'/sub/'+'${r.l.uuid}')">${qrText}</button>
       <button class="act-btn act-sub" style="background:var(--purple-dim);color:var(--purple)" onclick="shareLink('${r.l.uuid}')">${shareText}</button>
       <button class="act-btn act-copy" onclick="cpStatus('${r.l.uuid}')">${statusText}</button>
       <button class="act-btn act-del" onclick="delLink('${r.l.uuid}')">${delText}</button>
@@ -1975,7 +1938,7 @@ async function downloadBackup(){
     const blob=await r.blob();
     const url=URL.createObjectURL(blob);
     const a=document.createElement('a');
-    a.href=url;a.download='luffy-backup-'+Date.now()+'.json';
+    a.href=url;a.download='meiteeam-backup-'+Date.now()+'.json';
     a.click();
     URL.revokeObjectURL(url);
     toast('Backup exported');
@@ -2099,7 +2062,7 @@ function showQR(txt){
 function dlQR(){
   const a=document.createElement('a');
   a.href=$m('qr-img').src;
-  a.download='luffy-qr.png';
+  a.download='meiteeam-qr.png';
   a.click();
 }
 
@@ -2229,65 +2192,13 @@ function renderAddrs(){
     el.innerHTML='<div style="color:var(--text3);font-size:12px">No addresses added</div>';
     return;
   }
-  const indexed=allAddrs.map((a,i)=>({a,i}));
-  indexed.sort((x,y)=>{
-    const px=pingResults[x.a],py=pingResults[y.a];
-    const okx=px&&px.ok, oky=py&&py.ok;
-    if(okx&&oky)return px.ms-py.ms;
-    if(okx&&!oky)return -1;
-    if(!okx&&oky)return 1;
-    return x.i-y.i;
-  });
-  el.innerHTML=indexed.map(({a,i})=>{
-    const p=pingResults[a];
-    let badge='';
-    if(p){
-      if(p.pending){
-        badge='<span class="tag" style="background:var(--surface3);color:var(--text3)">⏳ Testing…</span>';
-      }else if(p.ok){
-        const col=p.ms<150?'var(--green)':(p.ms<400?'var(--yellow)':'var(--red)');
-        const dim=p.ms<150?'var(--green-dim)':(p.ms<400?'var(--yellow-dim)':'var(--red-dim)');
-        badge=`<span class="tag" style="background:${dim};color:${col}">${p.ms} ms</span>`;
-      }else{
-        badge='<span class="tag" style="background:var(--red-dim);color:var(--red)">Failed</span>';
-      }
-    }
-    return `<div style="display:flex;align-items:center;justify-content:space-between;padding:12px 14px;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px">
+  el.innerHTML=allAddrs.map((a,i)=>`<div style="display:flex;align-items:center;justify-content:space-between;padding:12px 14px;background:var(--surface3);border:1px solid var(--border);border-radius:10px;margin-bottom:8px">
     <div style="display:flex;align-items:center;gap:10px">
       <span style="color:var(--accent);font-size:16px">🌐</span>
       <div><div style="font-size:14px;font-weight:600">${esc(a)}</div><div style="font-size:11px;color:var(--text3);margin-top:2px;">Address #${i+1}</div></div>
     </div>
-    <div style="display:flex;align-items:center;gap:8px">
-      ${badge}
-      <button class="act-btn act-del" onclick="delAddr(${i})">Del</button>
-    </div>
-  </div>`;
-  }).join('');
-}
-
-async function pingAddrs(){
-  if(!allAddrs||!allAddrs.length){toast('No addresses to test',true);return;}
-  const btn=$m('ping-btn');
-  if(btn){btn.disabled=true;btn.textContent='⏳ Testing…';}
-  pingResults={};
-  allAddrs.forEach(a=>{pingResults[a]={pending:true};});
-  renderAddrs();
-  try{
-    const r=await fetch('/api/addresses/ping',{method:'POST'});
-    if(!r.ok)throw new Error();
-    const d=await r.json();
-    pingResults={};
-    (d.results||[]).forEach(res=>{pingResults[res.address]=res;});
-    renderAddrs();
-    const okCount=(d.results||[]).filter(x=>x.ok).length;
-    toast(`Tested ${d.results.length} addresses · ${okCount} reachable`);
-  }catch(e){
-    toast('Speed test failed',true);
-    pingResults={};
-    renderAddrs();
-  }finally{
-    if(btn){btn.disabled=false;btn.textContent='⚡ Test Speed';}
-  }
+    <button class="act-btn act-del" onclick="delAddr(${i})">Del</button>
+  </div>`).join('');
 }
 
 function showAddAddrMo(){$m('na').value='';$m('mo-addr').classList.add('show');}
@@ -2352,3 +2263,4 @@ async def panel_page(request: Request):
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=CONFIG["port"])
+
