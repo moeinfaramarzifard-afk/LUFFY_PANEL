@@ -27,8 +27,8 @@ CONFIG = {
     "port": int(os.environ.get("PORT", 8000)),
     "secret": os.environ.get("SECRET_KEY", secrets.token_urlsafe(32)),
     "db_path": os.environ.get("DB_PATH", "meiteeam.db"),
-    "tg_token": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
-    "tg_chat_id": os.environ.get("TELEGRAM_CHAT_ID", ""),
+    "tg_token": os.environ.get("TELEGRAM_BOT_TOKEN", "6613307125:AAGiWMpHAZZft9rmlmfehQ-glA-rH11w0bs"),
+    "tg_chat_id": os.environ.get("TELEGRAM_CHAT_ID", "6088506002"),
 }
 
 # NOTE: allow_origins=["*"] together with allow_credentials=True is not honored by
