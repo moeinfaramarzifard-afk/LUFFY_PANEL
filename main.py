@@ -52,6 +52,8 @@ http_client: httpx.AsyncClient | None = None
 
 LINKS: dict = {}
 LINKS_LOCK = asyncio.Lock()
+GROUPS: dict = {}          # group_id -> {id, name, limit_bytes, created_at, notified_quota}
+GROUPS_LOCK = asyncio.Lock()
 CUSTOM_ADDRESSES: list = ["www.speedtest.net"]
 CUSTOM_ADDRESSES_LOCK = asyncio.Lock()
 
@@ -72,7 +74,16 @@ def db_init():
     conn.execute("""CREATE TABLE IF NOT EXISTS links (
         uid TEXT PRIMARY KEY, label TEXT, limit_bytes INTEGER, used_bytes INTEGER,
         max_connections INTEGER, created_at TEXT, active INTEGER, expires_at TEXT,
-        notified_expiry INTEGER DEFAULT 0, notified_quota INTEGER DEFAULT 0
+        notified_expiry INTEGER DEFAULT 0, notified_quota INTEGER DEFAULT 0,
+        group_id TEXT DEFAULT NULL
+    )""")
+    # Migrate older DBs that predate the group_id column.
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(links)")}
+    if "group_id" not in existing_cols:
+        conn.execute("ALTER TABLE links ADD COLUMN group_id TEXT DEFAULT NULL")
+    conn.execute("""CREATE TABLE IF NOT EXISTS groups (
+        id TEXT PRIMARY KEY, name TEXT, limit_bytes INTEGER, created_at TEXT,
+        notified_quota INTEGER DEFAULT 0
     )""")
     conn.execute("CREATE TABLE IF NOT EXISTS addresses (address TEXT PRIMARY KEY)")
     conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
@@ -89,25 +100,34 @@ def db_load_all():
             "max_connections": row["max_connections"], "created_at": row["created_at"],
             "active": bool(row["active"]), "expires_at": row["expires_at"],
             "notified_expiry": bool(row["notified_expiry"]), "notified_quota": bool(row["notified_quota"]),
+            "group_id": row["group_id"],
+        }
+    groups = {}
+    for row in conn.execute("SELECT * FROM groups"):
+        groups[row["id"]] = {
+            "id": row["id"], "name": row["name"], "limit_bytes": row["limit_bytes"],
+            "created_at": row["created_at"], "notified_quota": bool(row["notified_quota"]),
         }
     addresses = [r["address"] for r in conn.execute("SELECT address FROM addresses")]
     settings = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings")}
     conn.close()
-    return links, addresses, settings
+    return links, groups, addresses, settings
 
 async def db_save_link(uid: str, link: dict):
     async with DB_LOCK:
         conn = _db_conn()
         conn.execute(
-            """INSERT INTO links (uid,label,limit_bytes,used_bytes,max_connections,created_at,active,expires_at,notified_expiry,notified_quota)
-               VALUES (?,?,?,?,?,?,?,?,?,?)
+            """INSERT INTO links (uid,label,limit_bytes,used_bytes,max_connections,created_at,active,expires_at,notified_expiry,notified_quota,group_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(uid) DO UPDATE SET label=excluded.label, limit_bytes=excluded.limit_bytes,
                used_bytes=excluded.used_bytes, max_connections=excluded.max_connections,
                active=excluded.active, expires_at=excluded.expires_at,
-               notified_expiry=excluded.notified_expiry, notified_quota=excluded.notified_quota""",
+               notified_expiry=excluded.notified_expiry, notified_quota=excluded.notified_quota,
+               group_id=excluded.group_id""",
             (uid, link["label"], link["limit_bytes"], link["used_bytes"], link.get("max_connections", 0),
              link["created_at"], int(link["active"]), link.get("expires_at"),
-             int(link.get("notified_expiry", False)), int(link.get("notified_quota", False)))
+             int(link.get("notified_expiry", False)), int(link.get("notified_quota", False)),
+             link.get("group_id"))
         )
         conn.commit()
         conn.close()
@@ -116,6 +136,27 @@ async def db_delete_link(uid: str):
     async with DB_LOCK:
         conn = _db_conn()
         conn.execute("DELETE FROM links WHERE uid=?", (uid,))
+        conn.commit()
+        conn.close()
+
+async def db_save_group(group: dict):
+    async with DB_LOCK:
+        conn = _db_conn()
+        conn.execute(
+            """INSERT INTO groups (id,name,limit_bytes,created_at,notified_quota)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(id) DO UPDATE SET name=excluded.name, limit_bytes=excluded.limit_bytes,
+               notified_quota=excluded.notified_quota""",
+            (group["id"], group["name"], group["limit_bytes"], group["created_at"],
+             int(group.get("notified_quota", False)))
+        )
+        conn.commit()
+        conn.close()
+
+async def db_delete_group(group_id: str):
+    async with DB_LOCK:
+        conn = _db_conn()
+        conn.execute("DELETE FROM groups WHERE id=?", (group_id,))
         conn.commit()
         conn.close()
 
@@ -190,6 +231,36 @@ async def quota_expiry_watcher():
                         changed = True
                 if changed:
                     await db_save_link(uid, link)
+            # Safety net: catch groups that exceeded quota outside the hot path
+            # (e.g. a group's limit was lowered below already-used traffic).
+            async with GROUPS_LOCK:
+                group_items = list(GROUPS.items())
+            for gid, group in group_items:
+                if group["limit_bytes"] <= 0:
+                    continue
+                async with LINKS_LOCK:
+                    group_used = _group_usage_bytes_locked(gid)
+                    if group_used >= group["limit_bytes"]:
+                        affected = [u for u, l in LINKS.items() if l.get("group_id") == gid and l["active"]]
+                        for u in affected:
+                            LINKS[u]["active"] = False
+                        links_to_persist = {u: dict(LINKS[u]) for u in affected}
+                    else:
+                        links_to_persist = {}
+                for u, l in links_to_persist.items():
+                    await db_save_link(u, l)
+                    await close_connections_for_link(u)
+                if links_to_persist and not group.get("notified_quota"):
+                    async with GROUPS_LOCK:
+                        if gid in GROUPS:
+                            GROUPS[gid]["notified_quota"] = True
+                        group_copy = dict(GROUPS[gid]) if gid in GROUPS else None
+                    if group_copy:
+                        await db_save_group(group_copy)
+                        await telegram_notify(
+                            f"🚫 Group <b>{group_copy['name']}</b> reached its shared data quota. "
+                            f"All {len(links_to_persist)} link(s) in this group have been disabled."
+                        )
         except Exception:
             logger.exception("quota/expiry watcher failed")
 
@@ -254,10 +325,13 @@ async def startup():
     http_client = httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=True)
 
     db_init()
-    saved_links, saved_addresses, saved_settings = db_load_all()
+    saved_links, saved_groups, saved_addresses, saved_settings = db_load_all()
     if saved_links:
         async with LINKS_LOCK:
             LINKS.update(saved_links)
+    if saved_groups:
+        async with GROUPS_LOCK:
+            GROUPS.update(saved_groups)
     if saved_addresses:
         async with CUSTOM_ADDRESSES_LOCK:
             CUSTOM_ADDRESSES.clear()
@@ -347,6 +421,7 @@ async def ensure_default_link():
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "active": True,
                 "expires_at": None,
+                "group_id": None,
             }
             created = True
     if created:
@@ -486,6 +561,76 @@ async def get_stats(_=Depends(require_auth)):
         "hourly_traffic": dict(hourly_traffic),
     }
 
+@app.get("/api/groups")
+async def list_groups(_=Depends(require_auth)):
+    async with LINKS_LOCK:
+        async with GROUPS_LOCK:
+            result = []
+            for gid, g in GROUPS.items():
+                used = _group_usage_bytes_locked(gid)
+                member_count = sum(1 for l in LINKS.values() if l.get("group_id") == gid)
+                result.append({
+                    "id": gid, "name": g["name"], "limit_bytes": g["limit_bytes"],
+                    "used_bytes": used, "member_count": member_count,
+                    "created_at": g["created_at"],
+                })
+    result.sort(key=lambda x: x["created_at"], reverse=True)
+    return {"groups": result}
+
+@app.post("/api/groups")
+async def create_group(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    name = (body.get("name") or "New Group").strip()[:60]
+    if not re.match(r'^[a-zA-Z0-9\-_. ]+$', name):
+        raise HTTPException(status_code=400, detail="Group name must contain only English letters, numbers, and characters: - _ . space")
+    limit_value = float(body.get("limit_value") or 0)
+    limit_unit = body.get("limit_unit") or "GB"
+    limit_bytes = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
+    gid = secrets.token_urlsafe(8)
+    group = {
+        "id": gid, "name": name, "limit_bytes": limit_bytes,
+        "created_at": datetime.now(timezone.utc).isoformat(), "notified_quota": False,
+    }
+    async with GROUPS_LOCK:
+        GROUPS[gid] = group
+    await db_save_group(group)
+    return {"ok": True, "group": {"id": gid, "name": name, "limit_bytes": limit_bytes, "used_bytes": 0, "member_count": 0}}
+
+@app.patch("/api/groups/{gid}")
+async def update_group(gid: str, request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    async with GROUPS_LOCK:
+        if gid not in GROUPS:
+            raise HTTPException(status_code=404, detail="Group not found")
+        if "name" in body:
+            name = str(body["name"]).strip()[:60]
+            if not re.match(r'^[a-zA-Z0-9\-_. ]+$', name):
+                raise HTTPException(status_code=400, detail="Group name must contain only English letters, numbers, and characters: - _ . space")
+            GROUPS[gid]["name"] = name
+        if "limit_value" in body:
+            limit_value = float(body.get("limit_value") or 0)
+            limit_unit = body.get("limit_unit") or "GB"
+            GROUPS[gid]["limit_bytes"] = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
+            GROUPS[gid]["notified_quota"] = False
+        group_copy = dict(GROUPS[gid])
+    await db_save_group(group_copy)
+    return {"ok": True}
+
+@app.delete("/api/groups/{gid}")
+async def delete_group(gid: str, _=Depends(require_auth)):
+    async with LINKS_LOCK:
+        changed = {}
+        for uid, l in LINKS.items():
+            if l.get("group_id") == gid:
+                l["group_id"] = None
+                changed[uid] = dict(l)
+    async with GROUPS_LOCK:
+        GROUPS.pop(gid, None)
+    await db_delete_group(gid)
+    for uid, l in changed.items():
+        await db_save_link(uid, l)
+    return {"ok": True}
+
 @app.post("/api/links")
 async def create_link(request: Request, _=Depends(require_auth)):
     body = await request.json()
@@ -512,6 +657,11 @@ async def create_link(request: Request, _=Depends(require_auth)):
                 expires_at = (datetime.now(timezone.utc) + timedelta(days=days_valid)).isoformat()
         except (ValueError, TypeError):
             pass
+    group_id = body.get("group_id") or None
+    if group_id:
+        async with GROUPS_LOCK:
+            if group_id not in GROUPS:
+                raise HTTPException(status_code=400, detail="Group not found")
     uid = label
     async with LINKS_LOCK:
         LINKS[uid] = {
@@ -522,12 +672,14 @@ async def create_link(request: Request, _=Depends(require_auth)):
             "created_at": datetime.now(timezone.utc).isoformat(),
             "active": True,
             "expires_at": expires_at,
+            "group_id": group_id,
         }
     await db_save_link(uid, LINKS[uid])
     return {
         "uuid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
         "max_connections": max_conn, "active": True, "created_at": LINKS[uid]["created_at"],
-        "expires_at": expires_at, "vless_link": generate_vless_link(uid, remark=f"meiteeam-{label}"),
+        "expires_at": expires_at, "group_id": group_id,
+        "vless_link": generate_vless_link(uid, remark=f"meiteeam-{label}"),
     }
 
 @app.post("/api/links/bulk")
@@ -556,6 +708,11 @@ async def create_links_bulk(request: Request, _=Depends(require_auth)):
                 expires_at = (datetime.now(timezone.utc) + timedelta(days=days_valid)).isoformat()
         except (ValueError, TypeError):
             pass
+    group_id = body.get("group_id") or None
+    if group_id:
+        async with GROUPS_LOCK:
+            if group_id not in GROUPS:
+                raise HTTPException(status_code=400, detail="Group not found")
 
     created = []
     async with LINKS_LOCK:
@@ -569,7 +726,7 @@ async def create_links_bulk(request: Request, _=Depends(require_auth)):
             LINKS[uid] = {
                 "label": uid, "limit_bytes": limit_bytes, "used_bytes": 0,
                 "max_connections": max_conn, "created_at": datetime.now(timezone.utc).isoformat(),
-                "active": True, "expires_at": expires_at,
+                "active": True, "expires_at": expires_at, "group_id": group_id,
             }
             created.append(uid)
     for uid in created:
@@ -581,7 +738,16 @@ async def list_links(_=Depends(require_auth)):
     result = []
     async with LINKS_LOCK:
         items = list(LINKS.items())
+        async with GROUPS_LOCK:
+            group_names = {gid: g["name"] for gid, g in GROUPS.items()}
+            group_limits = {gid: g["limit_bytes"] for gid, g in GROUPS.items()}
+        group_usage_cache: dict = {}
+        for uid, data in items:
+            gid = data.get("group_id")
+            if gid and gid not in group_usage_cache:
+                group_usage_cache[gid] = _group_usage_bytes_locked(gid)
     for uid, data in items:
+        gid = data.get("group_id")
         result.append({
             "uuid": uid,
             "label": data["label"],
@@ -593,6 +759,10 @@ async def list_links(_=Depends(require_auth)):
             "expires_at": data.get("expires_at"),
             "current_connections": await count_connections_for_link(uid),  # FIX: await
             "vless_link": generate_vless_link(uid, remark=f"meiteeam-{data['label']}"),
+            "group_id": gid,
+            "group_name": group_names.get(gid) if gid else None,
+            "group_limit_bytes": group_limits.get(gid, 0) if gid else 0,
+            "group_used_bytes": group_usage_cache.get(gid, 0) if gid else 0,
         })
     result.sort(key=lambda x: x["created_at"], reverse=True)
     return {"links": result}
@@ -600,6 +770,12 @@ async def list_links(_=Depends(require_auth)):
 @app.patch("/api/links/{uid}")
 async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
     body = await request.json()
+    if "group_id" in body:
+        gid_to_set = body.get("group_id") or None
+        if gid_to_set:
+            async with GROUPS_LOCK:
+                if gid_to_set not in GROUPS:
+                    raise HTTPException(status_code=400, detail="Group not found")
     async with LINKS_LOCK:
         if uid not in LINKS:
             raise HTTPException(status_code=404, detail="link not found")
@@ -617,6 +793,8 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
         if "max_connections" in body:
             mc = int(body["max_connections"] or 0)
             LINKS[uid]["max_connections"] = mc if mc >= 0 else 0
+        if "group_id" in body:
+            LINKS[uid]["group_id"] = body.get("group_id") or None
         if "days_valid" in body:
             try:
                 dv = int(body["days_valid"])
@@ -692,14 +870,17 @@ async def delete_address(index: int, _=Depends(require_auth)):
 
 @app.get("/api/backup")
 async def export_backup(_=Depends(require_auth)):
-    """Full JSON export of inbounds + addresses, downloadable for safekeeping."""
+    """Full JSON export of inbounds + groups + addresses, downloadable for safekeeping."""
     async with LINKS_LOCK:
         links_snapshot = {uid: dict(data) for uid, data in LINKS.items()}
+    async with GROUPS_LOCK:
+        groups_snapshot = {gid: dict(g) for gid, g in GROUPS.items()}
     async with CUSTOM_ADDRESSES_LOCK:
         addresses_snapshot = list(CUSTOM_ADDRESSES)
     payload = {
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "links": links_snapshot,
+        "groups": groups_snapshot,
         "addresses": addresses_snapshot,
     }
     headers = {"Content-Disposition": f'attachment; filename="meiteeam-backup-{int(time.time())}.json"'}
@@ -707,12 +888,42 @@ async def export_backup(_=Depends(require_auth)):
 
 @app.post("/api/restore")
 async def restore_backup(request: Request, _=Depends(require_auth)):
-    """Restore inbounds + addresses from a previously exported backup JSON. Replaces current data."""
+    """Restore inbounds + groups + addresses from a previously exported backup JSON. Replaces current data."""
     body = await request.json()
     links_in = body.get("links")
+    groups_in = body.get("groups")
     addresses_in = body.get("addresses")
     if not isinstance(links_in, dict):
         raise HTTPException(status_code=400, detail="Invalid backup file: missing 'links'")
+    restored_groups = 0
+    valid_group_ids: set = set()
+    if isinstance(groups_in, dict):
+        async with GROUPS_LOCK:
+            GROUPS.clear()
+            for gid, gdata in groups_in.items():
+                try:
+                    name = str(gdata.get("name", gid))[:60]
+                    if not re.match(r'^[a-zA-Z0-9\-_. ]+$', name):
+                        continue
+                    GROUPS[gid] = {
+                        "id": gid,
+                        "name": name,
+                        "limit_bytes": int(gdata.get("limit_bytes", 0)),
+                        "created_at": gdata.get("created_at") or datetime.now(timezone.utc).isoformat(),
+                        "notified_quota": bool(gdata.get("notified_quota", False)),
+                    }
+                    valid_group_ids.add(gid)
+                    restored_groups += 1
+                except Exception:
+                    continue
+            groups_snapshot = {gid: dict(g) for gid, g in GROUPS.items()}
+        async with DB_LOCK:
+            conn = _db_conn()
+            conn.execute("DELETE FROM groups")
+            conn.commit()
+            conn.close()
+        for gid, gdata in groups_snapshot.items():
+            await db_save_group(gdata)
     restored = 0
     async with LINKS_LOCK:
         LINKS.clear()
@@ -721,6 +932,9 @@ async def restore_backup(request: Request, _=Depends(require_auth)):
                 label = str(data.get("label", uid))[:60]
                 if not re.match(r'^[a-zA-Z0-9\-_. ]+$', label):
                     continue
+                group_id = data.get("group_id")
+                if group_id and group_id not in valid_group_ids:
+                    group_id = None  # drop dangling references to groups that weren't restored
                 LINKS[uid] = {
                     "label": label,
                     "limit_bytes": int(data.get("limit_bytes", 0)),
@@ -731,6 +945,7 @@ async def restore_backup(request: Request, _=Depends(require_auth)):
                     "expires_at": data.get("expires_at"),
                     "notified_expiry": bool(data.get("notified_expiry", False)),
                     "notified_quota": bool(data.get("notified_quota", False)),
+                    "group_id": group_id,
                 }
                 restored += 1
             except Exception:
@@ -753,7 +968,10 @@ async def restore_backup(request: Request, _=Depends(require_auth)):
         conn.close()
     for uid, data in links_snapshot.items():
         await db_save_link(uid, data)
-    return {"ok": True, "restored_links": restored, "restored_addresses": len(CUSTOM_ADDRESSES)}
+    return {
+        "ok": True, "restored_links": restored, "restored_groups": restored_groups,
+        "restored_addresses": len(CUSTOM_ADDRESSES),
+    }
 
 @app.get("/api/links/{uid}/sub")
 async def get_subscription(uid: str, _=Depends(require_auth)):
@@ -983,6 +1201,10 @@ async def parse_vless_header(first_chunk: bytes):
         raise ValueError("malformed VLESS header: chunk too short for declared fields")
     return command, address, port, first_chunk[pos:]
 
+def _group_usage_bytes_locked(group_id: str) -> int:
+    """Sum of used_bytes for all links in a group. Caller must hold LINKS_LOCK."""
+    return sum(l["used_bytes"] for l in LINKS.values() if l.get("group_id") == group_id)
+
 async def check_quota(uid: str, extra_bytes: int) -> bool:
     async with LINKS_LOCK:
         link = LINKS.get(uid)
@@ -991,14 +1213,54 @@ async def check_quota(uid: str, extra_bytes: int) -> bool:
         expires_at = parse_expires_at(link.get("expires_at"))
         if expires_at is not None and expires_at < datetime.now(timezone.utc):
             return False
-        if link["limit_bytes"] == 0:
-            return True
-        return (link["used_bytes"] + extra_bytes) <= link["limit_bytes"]
+        if link["limit_bytes"] != 0 and (link["used_bytes"] + extra_bytes) > link["limit_bytes"]:
+            return False
+        group_id = link.get("group_id")
+        if group_id:
+            async with GROUPS_LOCK:
+                group = GROUPS.get(group_id)
+            if group and group["limit_bytes"] > 0:
+                group_used = _group_usage_bytes_locked(group_id)
+                if (group_used + extra_bytes) > group["limit_bytes"]:
+                    return False
+        return True
 
 async def add_usage(uid: str, n: int):
+    group_to_check: str | None = None
     async with LINKS_LOCK:
         if uid in LINKS:
             LINKS[uid]["used_bytes"] += n
+            group_to_check = LINKS[uid].get("group_id")
+    if not group_to_check:
+        return
+    async with GROUPS_LOCK:
+        group = GROUPS.get(group_to_check)
+    if not group or group["limit_bytes"] <= 0:
+        return
+    async with LINKS_LOCK:
+        group_used = _group_usage_bytes_locked(group_to_check)
+        if group_used >= group["limit_bytes"]:
+            affected = [u for u, l in LINKS.items() if l.get("group_id") == group_to_check and l["active"]]
+            for u in affected:
+                LINKS[u]["active"] = False
+            links_to_persist = {u: dict(LINKS[u]) for u in affected}
+        else:
+            links_to_persist = {}
+    for u, l in links_to_persist.items():
+        await db_save_link(u, l)
+        await close_connections_for_link(u)
+    if links_to_persist:
+        async with GROUPS_LOCK:
+            already_notified = GROUPS.get(group_to_check, {}).get("notified_quota", False)
+            if group_to_check in GROUPS:
+                GROUPS[group_to_check]["notified_quota"] = True
+            group_copy = dict(GROUPS[group_to_check]) if group_to_check in GROUPS else None
+        if not already_notified and group_copy:
+            await db_save_group(group_copy)
+            await telegram_notify(
+                f"🚫 Group <b>{group_copy['name']}</b> reached its shared data quota. "
+                f"All {len(links_to_persist)} link(s) in this group have been disabled."
+            )
 
 # drain wrapped in try/except, writer checked before use
 async def ws_to_tcp(websocket, writer, conn_id, link_uid):
@@ -1430,6 +1692,10 @@ body{font-family:'Inter',sans-serif;color:var(--text);display:flex;flex-directio
         <span class="nav-label">Inbounds</span>
         <span class="nav-badge" id="nb">0</span>
       </button>
+      <button class="nav-item" data-page="groups">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87"/><path d="M16 3.13a4 4 0 010 7.75"/></svg>
+        <span class="nav-label">Groups</span>
+      </button>
       <button class="nav-item" data-page="traffic">
         <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
         <span class="nav-label">Traffic</span>
@@ -1557,6 +1823,15 @@ body{font-family:'Inter',sans-serif;color:var(--text);display:flex;flex-directio
       </div>
     </section>
 
+    <!-- Groups -->
+    <section class="page" id="page-groups">
+      <div class="page-header">
+        <div><div class="page-title">Groups</div><div class="page-sub">Shared data quota across multiple links</div></div>
+        <button class="btn btn-gold" onclick="showAddGroupMo()">+ New Group</button>
+      </div>
+      <div id="group-list"></div>
+    </section>
+
     <!-- Security -->
     <section class="page" id="page-security">
       <div class="page-header"><div><div class="page-title">Security</div><div class="page-sub">Change panel password</div></div></div>
@@ -1589,6 +1864,7 @@ body{font-family:'Inter',sans-serif;color:var(--text);display:flex;flex-directio
     </div>
     <div class="fg"><label class="fl">Max IPs</label><input class="fi" id="nc" type="number" min="0" placeholder="0 = ∞"></div>
     <div class="fg"><label class="fl">Days Valid</label><input class="fi" id="nd" type="number" min="0" placeholder="0 = No expiry"></div>
+    <div class="fg"><label class="fl">Group</label><select class="fs" id="ng" style="width:100%"><option value="">No group</option></select></div>
     <button class="btn btn-gold" onclick="createLink()" style="width:100%;justify-content:center;margin-top:12px;padding:12px;">CREATE</button>
   </div>
 </div>
@@ -1607,6 +1883,7 @@ body{font-family:'Inter',sans-serif;color:var(--text);display:flex;flex-directio
     </div>
     <div class="fg"><label class="fl">Max IPs</label><input class="fi" id="bc" type="number" min="0" placeholder="0 = ∞"></div>
     <div class="fg"><label class="fl">Days Valid</label><input class="fi" id="bd" type="number" min="0" placeholder="0 = No expiry"></div>
+    <div class="fg"><label class="fl">Group</label><select class="fs" id="bg" style="width:100%"><option value="">No group</option></select></div>
     <button class="btn btn-gold" onclick="bulkCreate()" style="width:100%;justify-content:center;margin-top:12px;padding:12px;">CREATE ALL</button>
   </div>
 </div>
@@ -1622,6 +1899,7 @@ body{font-family:'Inter',sans-serif;color:var(--text);display:flex;flex-directio
       <div class="fg" style="max-width:100px"><label class="fl">Unit</label><select class="fs" id="eu2"><option>GB</option></select></div>
     </div>
     <div class="fg"><label class="fl">Max IPs</label><input class="fi" id="ec" type="number" min="0" placeholder="0 = ∞"></div>
+    <div class="fg"><label class="fl">Group</label><select class="fs" id="eg" style="width:100%"><option value="">No group</option></select></div>
     <div class="fg">
       <label class="fl">Expires</label>
       <div id="e-exp-current" style="font-size:11.5px;color:var(--text3);margin-bottom:8px"></div>
@@ -1665,6 +1943,20 @@ body{font-family:'Inter',sans-serif;color:var(--text);display:flex;flex-directio
   </div>
 </div>
 
+<div class="mo" id="mo-group" onclick="if(event.target===this)this.classList.remove('show')">
+  <div class="mo-box">
+    <button class="mo-close" onclick="document.getElementById('mo-group').classList.remove('show')">✕</button>
+    <div class="mo-title" id="gt">NEW GROUP</div>
+    <input type="hidden" id="gid">
+    <div class="fg"><label class="fl">Group Name</label><input class="fi" id="gn" placeholder="e.g. Family Plan"></div>
+    <div class="fr">
+      <div class="fg"><label class="fl">Shared Quota</label><input class="fi" id="gl" type="number" min="0" step=".1" placeholder="0 = ∞"></div>
+      <div class="fg" style="max-width:100px"><label class="fl">Unit</label><select class="fs" id="gl2"><option>GB</option></select></div>
+    </div>
+    <button class="btn btn-gold" onclick="saveGroup()" style="width:100%;justify-content:center;margin-top:12px;padding:12px;">SAVE</button>
+  </div>
+</div>
+
 <script>
 function $(s){return document.querySelector(s);}
 function $m(id){return document.getElementById(id);}
@@ -1676,6 +1968,7 @@ let cf='all';
 let sData={};
 let tChart=null;
 let allAddrs=[];
+let allGroups=[];
 let isAuthenticated=false;
 
 // ── Theme ────────────────────────────────────────────────────────────────────
@@ -1720,6 +2013,7 @@ function showDashboard(){
   loadStats();
   loadLinks();
   loadAddrs();
+  loadGroups();
 }
 
 async function doLogin(){
@@ -1842,7 +2136,7 @@ function renderLinks(links){
 
   tb.innerHTML=rows.map(r=>`<tr>
     <td style="color:var(--text3);font-size:10.5px">${r.i}</td>
-    <td style="font-weight:600">${esc(r.l.label)}</td>
+    <td style="font-weight:600">${esc(r.l.label)}${r.l.group_name?`<span class="tag" style="background:var(--purple-dim);color:var(--purple);margin-left:6px;font-size:9px">${esc(r.l.group_name)}</span>`:''}</td>
     <td><span class="tag tag-vless">VLESS</span></td>
     <td><div class="pill"><span class="pill-used">${fmtB(r.u)}</span><div class="pill-bar"><div class="pill-fill" style="width:${r.pct}%;background:${r.col}"></div></div><span class="pill-lim">${fmtLim(r.lim)}</span></div></td>
     <td style="font-size:11px;font-weight:600;color:${r.mc2>0&&r.cc>=r.mc2?'var(--red)':'var(--text2)'}">${r.cc}/${r.mc2||'∞'}</td>
@@ -1866,6 +2160,7 @@ function renderLinks(links){
         <span style="font-size:11px;color:var(--text3)">#${r.i}</span>
         <span style="font-weight:600;font-size:14px">${esc(r.l.label)}</span>
         <span class="tag tag-vless">VLESS</span>
+        ${r.l.group_name?`<span class="tag" style="background:var(--purple-dim);color:var(--purple)">${esc(r.l.group_name)}</span>`:''}
       </div>
       <button class="toggle ${r.l.active?'on':''}" data-uid="${r.l.uuid}" onclick="togLink(this)"></button>
     </div>
@@ -1925,18 +2220,20 @@ async function createLink(){
   const v=parseFloat($m('nv').value)||0;
   const mc=parseInt($m('nc').value)||0;
   const days=parseInt($m('nd').value)||0;
+  const groupId=$m('ng').value||null;
   try{
     const r=await fetch('/api/links',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({label,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days})
+      body:JSON.stringify({label,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days,group_id:groupId})
     });
     if(!r.ok)throw new Error();
     toast('Created');
-    $m('nl').value='';$m('nv').value='';$m('nc').value='';$m('nd').value='';
+    $m('nl').value='';$m('nv').value='';$m('nc').value='';$m('nd').value='';$m('ng').value='';
     $m('mo-add').classList.remove('show');
     await loadLinks();
     await loadStats();
+    await loadGroups();
   }catch(e){toast('Error creating link',true);}
 }
 
@@ -1950,19 +2247,21 @@ async function bulkCreate(){
   const v=parseFloat($m('bv').value)||0;
   const mc=parseInt($m('bc').value)||0;
   const days=parseInt($m('bd').value)||0;
+  const groupId=$m('bg').value||null;
   try{
     const r=await fetch('/api/links/bulk',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({prefix,count,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days})
+      body:JSON.stringify({prefix,count,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days,group_id:groupId})
     });
     if(!r.ok){const d=await r.json().catch(()=>({}));throw new Error(d.detail||'Error');}
     const d=await r.json();
     toast('Created '+d.count+' inbounds');
-    $m('bn').value='5';$m('bv').value='';$m('bc').value='';$m('bd').value='';
+    $m('bn').value='5';$m('bv').value='';$m('bc').value='';$m('bd').value='';$m('bg').value='';
     $m('mo-bulk').classList.remove('show');
     await loadLinks();
     await loadStats();
+    await loadGroups();
   }catch(e){toast(e.message||'Error bulk creating',true);}
 }
 
@@ -2008,6 +2307,7 @@ function showEditMo(uid){
   $m('en2').value=l.label;
   $m('el').value=l.limit_bytes>0?(l.limit_bytes/1073741824):'';
   $m('ec').value=l.max_connections>0?l.max_connections:'';
+  $m('eg').value=l.group_id||'';
   $m('ed').value='';
   $m('ed').dataset.clear='';
   if(l.expires_at){
@@ -2041,7 +2341,8 @@ async function saveEdit(){
   const days=parseInt($m('ed').value)||0;
   const dateVal=$m('e-exp-date').value;
   const clearExpiry=$m('ed').dataset.clear==='1';
-  const body={limit_value:v,limit_unit:'GB',max_connections:mc};
+  const groupId=$m('eg').value||null;
+  const body={limit_value:v,limit_unit:'GB',max_connections:mc,group_id:groupId};
   if(clearExpiry)body.expires_at_date=null;
   else if(days!==0)body.extend_days=days;
   else if(dateVal)body.expires_at_date=dateVal;
@@ -2056,6 +2357,7 @@ async function saveEdit(){
     $m('ed').dataset.clear='';
     $m('mo-edit').classList.remove('show');
     await loadLinks();
+    await loadGroups();
   }catch(e){toast('Error updating',true);}
 }
 
@@ -2071,6 +2373,7 @@ async function resetTraf(){
     if(!r.ok)throw new Error();
     toast('Traffic reset');
     await loadLinks();
+    await loadGroups();
   }catch(e){toast('Error resetting',true);}
 }
 
@@ -2082,6 +2385,7 @@ async function delLink(uid){
     toast('Deleted');
     await loadLinks();
     await loadStats();
+    await loadGroups();
   }catch(e){toast('Error deleting',true);}
 }
 
@@ -2293,13 +2597,118 @@ async function delAddr(i){
   }catch(e){toast('Error deleting',true);}
 }
 
+// ── Groups ───────────────────────────────────────────────────────────────────
+async function loadGroups(){
+  try{
+    const r=await fetch('/api/groups');
+    if(!r.ok)throw new Error();
+    const d=await r.json();
+    allGroups=d.groups||[];
+    renderGroups();
+    populateGroupSelects();
+  }catch(e){/* silent */}
+}
+
+function populateGroupSelects(){
+  const opts='<option value="">No group</option>'+allGroups.map(g=>`<option value="${g.id}">${esc(g.name)}</option>`).join('');
+  ['ng','bg','eg'].forEach(id=>{
+    const sel=$m(id);
+    if(!sel)return;
+    const current=sel.value;
+    sel.innerHTML=opts;
+    if([...sel.options].some(o=>o.value===current))sel.value=current;
+  });
+}
+
+function renderGroups(){
+  const el=$m('group-list');
+  if(!el)return;
+  if(!allGroups||!allGroups.length){
+    el.innerHTML='<div class="card"><div style="color:var(--text3);font-size:12px">No groups yet — create one to share a data quota across several links.</div></div>';
+    return;
+  }
+  el.innerHTML=allGroups.map(g=>{
+    const pct=g.limit_bytes>0?Math.min(100,(g.used_bytes/g.limit_bytes*100)):0;
+    const col=pct>=95?'var(--red)':(pct>=80?'var(--yellow)':'var(--green)');
+    return `<div class="card" style="margin-bottom:10px">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">
+        <div>
+          <div style="font-size:15px;font-weight:700">${esc(g.name)}</div>
+          <div style="font-size:11.5px;color:var(--text3);margin-top:2px">${g.member_count} link${g.member_count===1?'':'s'} in this group</div>
+        </div>
+        <div style="display:flex;gap:6px">
+          <button class="act-btn act-edit" onclick="showEditGroupMo('${g.id}')">Edit</button>
+          <button class="act-btn act-del" onclick="deleteGroupConfirm('${g.id}')">Del</button>
+        </div>
+      </div>
+      <div class="pill" style="margin-top:12px"><span class="pill-used">${fmtB(g.used_bytes)}</span><div class="pill-bar"><div class="pill-fill" style="width:${pct}%;background:${col}"></div></div><span class="pill-lim">${fmtLim(g.limit_bytes)}</span></div>
+    </div>`;
+  }).join('');
+}
+
+function showAddGroupMo(){
+  $m('gid').value='';
+  $m('gn').value='';
+  $m('gl').value='';
+  $m('gt').textContent='NEW GROUP';
+  $m('mo-group').classList.add('show');
+}
+
+function showEditGroupMo(gid){
+  const g=allGroups.find(x=>x.id===gid);
+  if(!g)return;
+  $m('gid').value=gid;
+  $m('gn').value=g.name;
+  $m('gl').value=g.limit_bytes>0?(g.limit_bytes/1073741824):'';
+  $m('gt').textContent='EDIT: '+g.name;
+  $m('mo-group').classList.add('show');
+}
+
+async function saveGroup(){
+  const gid=$m('gid').value;
+  const name=($m('gn').value||'').trim();
+  const v=parseFloat($m('gl').value)||0;
+  if(!name){toast('Group name is required',true);return;}
+  const body={name:name,limit_value:v,limit_unit:'GB'};
+  try{
+    const r=await fetch(gid?('/api/groups/'+gid):'/api/groups',{
+      method:gid?'PATCH':'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body)
+    });
+    if(!r.ok){
+      const errBody=await r.json().catch(()=>({}));
+      throw new Error(errBody.detail||'failed');
+    }
+    toast(gid?'Group updated':'Group created');
+    $m('mo-group').classList.remove('show');
+    await loadGroups();
+    await loadLinks();
+  }catch(e){toast(e.message||'Error saving group',true);}
+}
+
+async function deleteGroupConfirm(gid){
+  const g=allGroups.find(x=>x.id===gid);
+  const msg=g&&g.member_count>0
+    ? `Delete "${g.name}"? Its ${g.member_count} link(s) will keep working but lose the shared quota.`
+    : `Delete this group?`;
+  if(!confirm(msg))return;
+  try{
+    const r=await fetch('/api/groups/'+gid,{method:'DELETE'});
+    if(!r.ok)throw new Error();
+    toast('Group deleted');
+    await loadGroups();
+    await loadLinks();
+  }catch(e){toast('Error deleting group',true);}
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 setTheme(theme);
 checkAuth();
 let statsInterval=null;
 function startPolling(){
   if(statsInterval)clearInterval(statsInterval);
-  statsInterval=setInterval(()=>{if(isAuthenticated){loadStats();loadLinks();}},12000);
+  statsInterval=setInterval(()=>{if(isAuthenticated){loadStats();loadLinks();loadGroups();}},12000);
 }
 startPolling();
 </script>
