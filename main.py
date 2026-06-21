@@ -44,6 +44,7 @@ connections_lock = asyncio.Lock()          # lock for connections
 connection_sockets: dict = {}
 link_ip_map: dict = defaultdict(set)
 SHARE_TOKENS: dict = {}   # token -> {uid, created_at, expires_at, used}
+ORDERS: dict = {}        # order_id -> {label, gb, days, status, uid, created_at}
 stats = {"total_bytes": 0, "total_requests": 0, "total_errors": 0, "start_time": time.time()}
 error_logs: deque = deque(maxlen=50)
 hourly_traffic: dict = defaultdict(int)
@@ -207,6 +208,123 @@ async def telegram_notify(text: str):
     except Exception:
         pass
 
+async def telegram_notify_with_buttons(text: str, buttons: list):
+    """buttons: list of {text, callback_data} rendered as one row of inline buttons."""
+    token, chat_id = CONFIG["tg_token"], CONFIG["tg_chat_id"]
+    if not token or not chat_id:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={
+                    "chat_id": chat_id, "text": text, "parse_mode": "HTML",
+                    "reply_markup": {"inline_keyboard": [buttons]},
+                }
+            )
+            return r.json()
+    except Exception:
+        return None
+
+async def telegram_edit_message(chat_id, message_id, text: str):
+    token = CONFIG["tg_token"]
+    if not token:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{token}/editMessageText",
+                json={"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML"}
+            )
+    except Exception:
+        pass
+
+async def telegram_answer_callback(callback_id: str, text: str = ""):
+    token = CONFIG["tg_token"]
+    if not token:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{token}/answerCallbackQuery",
+                json={"callback_query_id": callback_id, "text": text}
+            )
+    except Exception:
+        pass
+
+async def order_telegram_poller():
+    """Long-polls Telegram for Approve/Reject button taps on order requests."""
+    offset = 0
+    while True:
+        token, admin_id = CONFIG["tg_token"], CONFIG["tg_chat_id"]
+        if not token or not admin_id:
+            await asyncio.sleep(10)
+            continue
+        try:
+            async with httpx.AsyncClient(timeout=35.0) as client:
+                r = await client.get(
+                    f"https://api.telegram.org/bot{token}/getUpdates",
+                    params={"offset": offset, "timeout": 25, "allowed_updates": '["callback_query"]'}
+                )
+                data = r.json()
+        except Exception:
+            await asyncio.sleep(5)
+            continue
+        for update in data.get("result", []):
+            offset = update["update_id"] + 1
+            cq = update.get("callback_query")
+            if not cq:
+                continue
+            from_id = str(cq.get("from", {}).get("id", ""))
+            cdata = cq.get("data", "")
+            msg = cq.get("message", {})
+            chat_id = msg.get("chat", {}).get("id")
+            message_id = msg.get("message_id")
+            if from_id != str(admin_id) or ":" not in cdata:
+                await telegram_answer_callback(cq["id"], "Not authorized")
+                continue
+            action, order_id = cdata.split(":", 1)
+            order = ORDERS.get(order_id)
+            if order is None:
+                await telegram_answer_callback(cq["id"], "Order not found")
+                continue
+            if order["status"] != "pending":
+                await telegram_answer_callback(cq["id"], "Already handled")
+                continue
+            if action == "appr":
+                uid = await _provision_order(order)
+                order["status"] = "approved"
+                order["uid"] = uid
+                await telegram_answer_callback(cq["id"], "Approved ✅")
+                if chat_id and message_id:
+                    await telegram_edit_message(chat_id, message_id, f"✅ Approved — <b>{order['label']}</b> ({order['gb']}GB / {order['days']}d) is live.")
+            elif action == "rej":
+                order["status"] = "rejected"
+                await telegram_answer_callback(cq["id"], "Rejected ❌")
+                if chat_id and message_id:
+                    await telegram_edit_message(chat_id, message_id, f"❌ Rejected — <b>{order['label']}</b> request.")
+
+async def _provision_order(order: dict) -> str:
+    """Creates the actual inbound for an approved order. Returns the uid."""
+    label = order["label"]
+    async with LINKS_LOCK:
+        uid = label
+        n = 2
+        while uid in LINKS:
+            uid = f"{label}-{n}"
+            n += 1
+        limit_bytes = 0 if order["gb"] <= 0 else parse_size_to_bytes(order["gb"], "GB")
+        expires_at = None
+        if order["days"] > 0:
+            expires_at = (datetime.now(timezone.utc) + timedelta(days=order["days"])).isoformat()
+        LINKS[uid] = {
+            "label": uid, "limit_bytes": limit_bytes, "used_bytes": 0,
+            "max_connections": 0, "created_at": datetime.now(timezone.utc).isoformat(),
+            "active": True, "expires_at": expires_at, "group_id": None,
+        }
+    await db_save_link(uid, LINKS[uid])
+    return uid
+
 async def quota_expiry_watcher():
     """Checks every 5 minutes for links nearing quota/expiry and sends a one-time Telegram alert."""
     while True:
@@ -344,6 +462,7 @@ async def startup():
     asyncio.create_task(keep_alive())
     asyncio.create_task(flush_usage_to_db())
     asyncio.create_task(quota_expiry_watcher())
+    asyncio.create_task(order_telegram_poller())
     await ensure_default_link()
 
 @app.on_event("shutdown")
@@ -1097,6 +1216,138 @@ async def create_share_link(uid: str, _=Depends(require_auth)):
     token = secrets.token_urlsafe(24)
     SHARE_TOKENS[token] = {"uid": uid, "created_at": time.time(), "expires_at": time.time() + 86400, "used": False}
     return {"ok": True, "share_url": f"https://{get_domain()}/share/{token}"}
+
+@app.post("/order/api/submit")
+async def submit_order(request: Request):
+    body = await request.json()
+    label = (body.get("label") or "").strip()[:40]
+    if not label or not re.match(r'^[a-zA-Z0-9\-_. ]+$', label):
+        raise HTTPException(status_code=400, detail="Name must contain only English letters, numbers, and characters: - _ . space")
+    try:
+        gb = float(body.get("gb") or 0)
+        days = int(body.get("days") or 0)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid traffic or duration value")
+    if gb < 0 or gb > 10000 or days < 0 or days > 3650:
+        raise HTTPException(status_code=400, detail="Value out of allowed range")
+    note = (body.get("note") or "").strip()[:200]
+    order_id = secrets.token_urlsafe(10)
+    ORDERS[order_id] = {
+        "label": label, "gb": gb, "days": days, "note": note,
+        "status": "pending", "uid": None, "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    gb_str = "Unlimited" if gb <= 0 else f"{gb}GB"
+    days_str = "No expiry" if days <= 0 else f"{days} days"
+    text = f"🛒 <b>New order request</b>\n\n<b>Name:</b> {label}\n<b>Traffic:</b> {gb_str}\n<b>Duration:</b> {days_str}"
+    if note:
+        text += f"\n<b>Note:</b> {note}"
+    await telegram_notify_with_buttons(text, [
+        {"text": "✅ Approve", "callback_data": f"appr:{order_id}"},
+        {"text": "❌ Reject", "callback_data": f"rej:{order_id}"},
+    ])
+    return {"ok": True, "order_id": order_id}
+
+@app.get("/order/api/status/{order_id}")
+async def order_status(order_id: str):
+    order = ORDERS.get(order_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail="Order not found")
+    out = {"status": order["status"], "label": order["label"]}
+    if order["status"] == "approved" and order["uid"]:
+        uid = order["uid"]
+        async with LINKS_LOCK:
+            link = LINKS.get(uid)
+        if link:
+            out["vless_link"] = generate_vless_link(uid, remark=f"Meiteeam-{link['label']}")
+            out["sub_url"] = f"https://{get_domain()}/sub/{uid}"
+    return out
+
+@app.get("/order", response_class=HTMLResponse)
+async def order_page():
+    body = """
+        <div class="mono">M</div>
+        <h1>Request a Config</h1>
+        <p>Fill in what you need below. An admin will review and approve your request shortly.</p>
+        <div style="margin-top:18px">
+          <label style="font-size:10.5px;color:var(--text3);text-transform:uppercase;letter-spacing:.06em">Your Name</label>
+          <input id="o-label" type="text" placeholder="e.g. John" style="width:100%;margin-top:5px;padding:10px 12px;background:var(--surface3);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:inherit;font-size:13px">
+        </div>
+        <div style="margin-top:14px;display:flex;gap:10px">
+          <div style="flex:1">
+            <label style="font-size:10.5px;color:var(--text3);text-transform:uppercase;letter-spacing:.06em">Traffic (GB)</label>
+            <input id="o-gb" type="number" min="0" step=".5" placeholder="0 = unlimited" style="width:100%;margin-top:5px;padding:10px 12px;background:var(--surface3);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:inherit;font-size:13px">
+          </div>
+          <div style="flex:1">
+            <label style="font-size:10.5px;color:var(--text3);text-transform:uppercase;letter-spacing:.06em">Duration (days)</label>
+            <input id="o-days" type="number" min="0" placeholder="0 = unlimited" style="width:100%;margin-top:5px;padding:10px 12px;background:var(--surface3);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:inherit;font-size:13px">
+          </div>
+        </div>
+        <div style="margin-top:14px">
+          <label style="font-size:10.5px;color:var(--text3);text-transform:uppercase;letter-spacing:.06em">Note (optional)</label>
+          <input id="o-note" type="text" placeholder="Anything the admin should know" style="width:100%;margin-top:5px;padding:10px 12px;background:var(--surface3);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:inherit;font-size:13px">
+        </div>
+        <button class="copybtn" id="o-submit" onclick="submitOrder()">Submit Request</button>
+        <div id="o-err" style="color:var(--red);font-size:12px;margin-top:10px;display:none"></div>
+    """
+    html = _public_page("Request a Config", body)
+    html = html.replace("</script>", """
+async function submitOrder(){
+  const btn=document.getElementById('o-submit');
+  const err=document.getElementById('o-err');
+  err.style.display='none';
+  const label=document.getElementById('o-label').value.trim();
+  const gb=document.getElementById('o-gb').value||0;
+  const days=document.getElementById('o-days').value||0;
+  const note=document.getElementById('o-note').value.trim();
+  if(!label){err.textContent='Please enter your name.';err.style.display='block';return;}
+  btn.disabled=true;btn.textContent='Submitting...';
+  try{
+    const r=await fetch('/order/api/submit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label,gb,days,note})});
+    const d=await r.json();
+    if(!r.ok)throw new Error(d.detail||'Error submitting request');
+    location.href='/order/status/'+d.order_id;
+  }catch(e){
+    err.textContent=e.message||'Error submitting request';
+    err.style.display='block';
+    btn.disabled=false;btn.textContent='Submit Request';
+  }
+}
+</script>""")
+    return HTMLResponse(html)
+
+@app.get("/order/status/{order_id}", response_class=HTMLResponse)
+async def order_status_page(order_id: str):
+    order = ORDERS.get(order_id)
+    if order is None:
+        return HTMLResponse(_public_page("Not Found", '<div class="mono">!</div><h1>Order not found</h1><p>This request does not exist or has expired.</p>'), status_code=404)
+    if order["status"] == "pending":
+        body = f"""
+            <div class="mono">M</div>
+            <h1>{order['label']}</h1>
+            <p>Your request is waiting for admin approval. This page refreshes automatically — keep it open.</p>
+            <div class="row"><span>Status</span><span class="tag" style="color:var(--yellow)">Pending</span></div>
+        """
+        html = _public_page("Order Pending", body)
+        html = html.replace("</script>", "setTimeout(()=>location.reload(),5000);\n</script>")
+        return HTMLResponse(html)
+    if order["status"] == "rejected":
+        return HTMLResponse(_public_page("Request Rejected", f'<div class="mono">!</div><h1>{order["label"]}</h1><p>Your request was not approved. Please contact the admin for details.</p>'))
+    uid = order["uid"]
+    async with LINKS_LOCK:
+        link = LINKS.get(uid) if uid else None
+    if link is None:
+        return HTMLResponse(_public_page("Not Found", '<div class="mono">!</div><h1>Config not found</h1><p>This inbound no longer exists.</p>'))
+    vless_link = generate_vless_link(uid, remark=f"Meiteeam-{link['label']}")
+    sub_url = f"https://{get_domain()}/sub/{uid}"
+    body = f"""
+        <div class="mono">M</div>
+        <h1>{link['label']}</h1>
+        <p>Your request was approved! Save your config below.</p>
+        <div class="qr-box"><img src="https://api.qrserver.com/v1/create-qr-code/?size=240x240&data={quote(sub_url)}" alt="QR"></div>
+        <textarea id="cfgtxt" rows="3" readonly>{vless_link}</textarea>
+        <button class="copybtn" id="cpbtn" onclick="cp()">Copy Config</button>
+    """
+    return HTMLResponse(_public_page(f"{link['label']} · Approved", body))
 
 @app.get("/share/{token}", response_class=HTMLResponse)
 async def view_share_link(token: str):
