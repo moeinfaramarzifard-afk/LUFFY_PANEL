@@ -27,8 +27,8 @@ CONFIG = {
     "port": int(os.environ.get("PORT", 8000)),
     "secret": os.environ.get("SECRET_KEY", secrets.token_urlsafe(32)),
     "db_path": os.environ.get("DB_PATH", "meiteeam.db"),
-    "tg_token": os.environ.get("TELEGRAM_BOT_TOKEN", "8905347545:AAERoKsrfEojlYCgnmg41x0MYQvmM4OJogA"),
-    "tg_chat_id": os.environ.get("TELEGRAM_CHAT_ID", "6088506002"),
+    "tg_token": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+    "tg_chat_id": os.environ.get("TELEGRAM_CHAT_ID", ""),
 }
 
 # NOTE: allow_origins=["*"] together with allow_credentials=True is not honored by
@@ -435,62 +435,10 @@ def get_client_ip(websocket: WebSocket) -> str:
         return websocket.client.host
     return "unknown"
 
-# Recognize common VLESS/V2Ray client apps + OS platform from the WebSocket
-# handshake's User-Agent header. Best-effort only — clients can send anything.
-_DEVICE_APP_PATTERNS = [
-    (re.compile(r'v2rayNG', re.I), "v2rayNG"),
-    (re.compile(r'v2rayN\b', re.I), "v2rayN"),
-    (re.compile(r'Shadowrocket', re.I), "Shadowrocket"),
-    (re.compile(r'Streisand', re.I), "Streisand"),
-    (re.compile(r'Stash', re.I), "Stash"),
-    (re.compile(r'Clash[\s\-]?Meta', re.I), "Clash Meta"),
-    (re.compile(r'ClashX', re.I), "ClashX"),
-    (re.compile(r'Clash', re.I), "Clash"),
-    (re.compile(r'NekoBox|NekoRay', re.I), "NekoBox"),
-    (re.compile(r'Hiddify', re.I), "Hiddify"),
-    (re.compile(r'FairVPN|FairVPN', re.I), "FairVPN"),
-    (re.compile(r'Sing-?[Bb]ox|SFA|SFI|SFM|SFT', re.I), "sing-box"),
-    (re.compile(r'Loon', re.I), "Loon"),
-    (re.compile(r'Quantumult', re.I), "Quantumult"),
-    (re.compile(r'Surge', re.I), "Surge"),
-]
-_DEVICE_OS_PATTERNS = [
-    (re.compile(r'Android', re.I), "Android"),
-    (re.compile(r'iPhone|iPad|iOS|CFNetwork', re.I), "iOS"),
-    (re.compile(r'Windows', re.I), "Windows"),
-    (re.compile(r'Mac ?OS|Macintosh|Darwin', re.I), "macOS"),
-    (re.compile(r'Linux', re.I), "Linux"),
-]
-
-def parse_user_agent(ua: str) -> str | None:
-    """Returns a short human label like 'v2rayNG · Android', or just the OS / app
-    alone if only one is detected. Returns None if nothing recognizable is found."""
-    if not ua:
-        return None
-    app = next((label for pattern, label in _DEVICE_APP_PATTERNS if pattern.search(ua)), None)
-    os_name = next((label for pattern, label in _DEVICE_OS_PATTERNS if pattern.search(ua)), None)
-    if app and os_name:
-        return f"{app} · {os_name}"
-    if app:
-        return app
-    if os_name:
-        return os_name
-    return None
-
 # lock used here
 async def count_connections_for_link(uid: str) -> int:
     async with connections_lock:
         return sum(1 for info in connections.values() if info.get("uuid") == uid)
-
-async def current_device_label_for_link(uid: str) -> str | None:
-    """Returns the device/app label of the most recently connected active
-    session for this link, or None if no connection is currently open."""
-    async with connections_lock:
-        matches = [info for info in connections.values() if info.get("uuid") == uid]
-    if not matches:
-        return None
-    latest = max(matches, key=lambda info: info.get("connected_at") or "")
-    return latest.get("device_label")
 
 async def remove_ip_from_link(uid: str, ip: str):
     async with connections_lock:
@@ -810,7 +758,6 @@ async def list_links(_=Depends(require_auth)):
             "created_at": data["created_at"],
             "expires_at": data.get("expires_at"),
             "current_connections": await count_connections_for_link(uid),  # FIX: await
-            "device_label": await current_device_label_for_link(uid),
             "vless_link": generate_vless_link(uid, remark=f"meiteeam-{data['label']}"),
             "group_id": gid,
             "group_name": group_names.get(gid) if gid else None,
@@ -1216,7 +1163,22 @@ async def client_status_page(uid: str):
     return HTMLResponse(_public_page(f"{link['label']} · Status", body))
 
 # ── WebSocket tunnel ──────────────────────────────────────────────────────────
-RELAY_BUF = 64 * 1024
+RELAY_BUF = 128 * 1024   # increased: fewer read() syscalls = lower latency
+_FLUSH_BYTES = 1 * 1024 * 1024   # flush accumulated bytes every 1 MB...
+_FLUSH_SECS  = 2.0                # ...or every 2 seconds, whichever comes first
+
+async def _flush_usage(link_uid: str, conn_id: str, acc: int):
+    """Commit accumulated byte count to shared stats in one lock acquisition."""
+    if acc <= 0:
+        return
+    now = datetime.now(timezone.utc)
+    stats["total_bytes"] += acc
+    hourly_traffic[now.strftime("%H:00")] += acc
+    daily_traffic[now.strftime("%Y-%m-%d")]  += acc
+    async with connections_lock:
+        if conn_id in connections:
+            connections[conn_id]["bytes"] += acc
+    await add_usage(link_uid, acc)
 
 async def parse_vless_header(first_chunk: bytes):
     if len(first_chunk) < 24:
@@ -1317,6 +1279,8 @@ async def add_usage(uid: str, n: int):
 
 # drain wrapped in try/except, writer checked before use
 async def ws_to_tcp(websocket, writer, conn_id, link_uid):
+    acc = 0
+    last_flush = asyncio.get_event_loop().time()
     try:
         while True:
             msg = await websocket.receive()
@@ -1326,28 +1290,28 @@ async def ws_to_tcp(websocket, writer, conn_id, link_uid):
             if not data:
                 continue
             size = len(data)
-            if not await check_quota(link_uid, size):
+            if not await check_quota(link_uid, size + acc):
                 await websocket.close(code=1008, reason="quota exceeded")
                 break
-            stats["total_bytes"] += size
             stats["total_requests"] += 1
-            async with connections_lock:
-                if conn_id in connections:
-                    connections[conn_id]["bytes"] += size
-            hourly_traffic[datetime.now(timezone.utc).strftime("%H:00")] += size
-            daily_traffic[datetime.now(timezone.utc).strftime("%Y-%m-%d")] += size
-            await add_usage(link_uid, size)
+            acc += size
             try:
                 writer.write(data)
                 await writer.drain()   # drain inside try
             except Exception:
                 break
+            t = asyncio.get_event_loop().time()
+            if acc >= _FLUSH_BYTES or (t - last_flush) >= _FLUSH_SECS:
+                await _flush_usage(link_uid, conn_id, acc)
+                acc = 0
+                last_flush = t
     except WebSocketDisconnect:
         pass
     except Exception:
         pass
     finally:
-        # write_eof guarded for safety
+        if acc:
+            await _flush_usage(link_uid, conn_id, acc)
         try:
             if not writer.is_closing():
                 writer.write_eof()
@@ -1356,29 +1320,33 @@ async def ws_to_tcp(websocket, writer, conn_id, link_uid):
 
 async def tcp_to_ws(websocket, reader, conn_id, link_uid):
     first = True
+    acc = 0
+    last_flush = asyncio.get_event_loop().time()
     try:
         while True:
             data = await reader.read(RELAY_BUF)
             if not data:
                 break
             size = len(data)
-            if not await check_quota(link_uid, size):
+            if not await check_quota(link_uid, size + acc):
                 await websocket.close(code=1008, reason="quota exceeded")
                 break
-            stats["total_bytes"] += size
-            async with connections_lock:
-                if conn_id in connections:
-                    connections[conn_id]["bytes"] += size
-            hourly_traffic[datetime.now(timezone.utc).strftime("%H:00")] += size
-            daily_traffic[datetime.now(timezone.utc).strftime("%Y-%m-%d")] += size
-            await add_usage(link_uid, size)
+            acc += size
             try:
                 await websocket.send_bytes((b"\x00\x00" + data) if first else data)
                 first = False
             except Exception:
                 break
+            t = asyncio.get_event_loop().time()
+            if acc >= _FLUSH_BYTES or (t - last_flush) >= _FLUSH_SECS:
+                await _flush_usage(link_uid, conn_id, acc)
+                acc = 0
+                last_flush = t
     except Exception:
         pass
+    finally:
+        if acc:
+            await _flush_usage(link_uid, conn_id, acc)
 
 @app.websocket("/ws/{uuid}")
 async def websocket_tunnel(websocket: WebSocket, uuid: str):
@@ -1423,40 +1391,35 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
             return
 
         conn_id = secrets.token_urlsafe(8)
-        device_label = parse_user_agent(websocket.headers.get("user-agent", ""))
         async with connections_lock:
             connections[conn_id] = {
                 "uuid": uuid, "ip": client_ip,
                 "connected_at": datetime.now(timezone.utc).isoformat(),
                 "bytes": 0,
-                "device_label": device_label,
             }
             connection_sockets[conn_id] = websocket
             link_ip_map[uuid].add(client_ip)
 
         size = len(first_chunk)
-        stats["total_bytes"] += size
         stats["total_requests"] += 1
-        async with connections_lock:
-            if conn_id in connections:
-                connections[conn_id]["bytes"] += size
-        hourly_traffic[datetime.now(timezone.utc).strftime("%H:00")] += size
-        daily_traffic[datetime.now(timezone.utc).strftime("%Y-%m-%d")] += size
-        await add_usage(uuid, size)
+        await _flush_usage(uuid, conn_id, size)
 
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(address, port), timeout=10.0
         )
+        # Disable Nagle's algorithm: send small packets immediately instead of
+        # buffering — critical for interactive/low-latency proxy traffic.
+        sock = writer.transport.get_extra_info("socket")
+        if sock is not None:
+            import socket as _socket
+            try:
+                sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
+            except Exception:
+                pass
 
         if initial_payload:
             p_size = len(initial_payload)
-            stats["total_bytes"] += p_size
-            async with connections_lock:
-                if conn_id in connections:
-                    connections[conn_id]["bytes"] += p_size
-            hourly_traffic[datetime.now(timezone.utc).strftime("%H:00")] += p_size
-            daily_traffic[datetime.now(timezone.utc).strftime("%Y-%m-%d")] += p_size
-            await add_usage(uuid, p_size)
+            await _flush_usage(uuid, conn_id, p_size)
             try:
                 writer.write(initial_payload)
                 await writer.drain()   # safe drain
@@ -2229,7 +2192,7 @@ function renderLinks(links){
 
   tb.innerHTML=rows.map(r=>`<tr>
     <td style="color:var(--text3);font-size:10.5px">${r.i}</td>
-    <td style="font-weight:600">${esc(r.l.label)}${r.l.group_name?`<span class="tag" style="background:var(--purple-dim);color:var(--purple);margin-left:6px;font-size:9px">${esc(r.l.group_name)}</span>`:''}${r.l.device_label?`<span class="tag" style="background:var(--green-dim);color:var(--green);margin-left:6px;font-size:9px">● ${esc(r.l.device_label)}</span>`:''}</td>
+    <td style="font-weight:600">${esc(r.l.label)}${r.l.group_name?`<span class="tag" style="background:var(--purple-dim);color:var(--purple);margin-left:6px;font-size:9px">${esc(r.l.group_name)}</span>`:''}</td>
     <td><span class="tag tag-vless">VLESS</span></td>
     <td><div class="pill"><span class="pill-used">${fmtB(r.u)}</span><div class="pill-bar"><div class="pill-fill" style="width:${r.pct}%;background:${r.col}"></div></div><span class="pill-lim">${fmtLim(r.lim)}</span></div></td>
     <td style="font-size:11px;font-weight:600;color:${r.mc2>0&&r.cc>=r.mc2?'var(--red)':'var(--text2)'}">${r.cc}/${r.mc2||'∞'}</td>
@@ -2254,7 +2217,6 @@ function renderLinks(links){
         <span style="font-weight:600;font-size:14px">${esc(r.l.label)}</span>
         <span class="tag tag-vless">VLESS</span>
         ${r.l.group_name?`<span class="tag" style="background:var(--purple-dim);color:var(--purple)">${esc(r.l.group_name)}</span>`:''}
-        ${r.l.device_label?`<span class="tag" style="background:var(--green-dim);color:var(--green)">● ${esc(r.l.device_label)}</span>`:''}
       </div>
       <button class="toggle ${r.l.active?'on':''}" data-uid="${r.l.uuid}" onclick="togLink(this)"></button>
     </div>
