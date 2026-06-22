@@ -1163,22 +1163,7 @@ async def client_status_page(uid: str):
     return HTMLResponse(_public_page(f"{link['label']} · Status", body))
 
 # ── WebSocket tunnel ──────────────────────────────────────────────────────────
-RELAY_BUF = 128 * 1024   # increased: fewer read() syscalls = lower latency
-_FLUSH_BYTES = 1 * 1024 * 1024   # flush accumulated bytes every 1 MB...
-_FLUSH_SECS  = 2.0                # ...or every 2 seconds, whichever comes first
-
-async def _flush_usage(link_uid: str, conn_id: str, acc: int):
-    """Commit accumulated byte count to shared stats in one lock acquisition."""
-    if acc <= 0:
-        return
-    now = datetime.now(timezone.utc)
-    stats["total_bytes"] += acc
-    hourly_traffic[now.strftime("%H:00")] += acc
-    daily_traffic[now.strftime("%Y-%m-%d")]  += acc
-    async with connections_lock:
-        if conn_id in connections:
-            connections[conn_id]["bytes"] += acc
-    await add_usage(link_uid, acc)
+RELAY_BUF = 64 * 1024
 
 async def parse_vless_header(first_chunk: bytes):
     if len(first_chunk) < 24:
@@ -1279,8 +1264,6 @@ async def add_usage(uid: str, n: int):
 
 # drain wrapped in try/except, writer checked before use
 async def ws_to_tcp(websocket, writer, conn_id, link_uid):
-    acc = 0
-    last_flush = asyncio.get_event_loop().time()
     try:
         while True:
             msg = await websocket.receive()
@@ -1290,28 +1273,28 @@ async def ws_to_tcp(websocket, writer, conn_id, link_uid):
             if not data:
                 continue
             size = len(data)
-            if not await check_quota(link_uid, size + acc):
+            if not await check_quota(link_uid, size):
                 await websocket.close(code=1008, reason="quota exceeded")
                 break
+            stats["total_bytes"] += size
             stats["total_requests"] += 1
-            acc += size
+            async with connections_lock:
+                if conn_id in connections:
+                    connections[conn_id]["bytes"] += size
+            hourly_traffic[datetime.now(timezone.utc).strftime("%H:00")] += size
+            daily_traffic[datetime.now(timezone.utc).strftime("%Y-%m-%d")] += size
+            await add_usage(link_uid, size)
             try:
                 writer.write(data)
                 await writer.drain()   # drain inside try
             except Exception:
                 break
-            t = asyncio.get_event_loop().time()
-            if acc >= _FLUSH_BYTES or (t - last_flush) >= _FLUSH_SECS:
-                await _flush_usage(link_uid, conn_id, acc)
-                acc = 0
-                last_flush = t
     except WebSocketDisconnect:
         pass
     except Exception:
         pass
     finally:
-        if acc:
-            await _flush_usage(link_uid, conn_id, acc)
+        # write_eof guarded for safety
         try:
             if not writer.is_closing():
                 writer.write_eof()
@@ -1320,33 +1303,29 @@ async def ws_to_tcp(websocket, writer, conn_id, link_uid):
 
 async def tcp_to_ws(websocket, reader, conn_id, link_uid):
     first = True
-    acc = 0
-    last_flush = asyncio.get_event_loop().time()
     try:
         while True:
             data = await reader.read(RELAY_BUF)
             if not data:
                 break
             size = len(data)
-            if not await check_quota(link_uid, size + acc):
+            if not await check_quota(link_uid, size):
                 await websocket.close(code=1008, reason="quota exceeded")
                 break
-            acc += size
+            stats["total_bytes"] += size
+            async with connections_lock:
+                if conn_id in connections:
+                    connections[conn_id]["bytes"] += size
+            hourly_traffic[datetime.now(timezone.utc).strftime("%H:00")] += size
+            daily_traffic[datetime.now(timezone.utc).strftime("%Y-%m-%d")] += size
+            await add_usage(link_uid, size)
             try:
                 await websocket.send_bytes((b"\x00\x00" + data) if first else data)
                 first = False
             except Exception:
                 break
-            t = asyncio.get_event_loop().time()
-            if acc >= _FLUSH_BYTES or (t - last_flush) >= _FLUSH_SECS:
-                await _flush_usage(link_uid, conn_id, acc)
-                acc = 0
-                last_flush = t
     except Exception:
         pass
-    finally:
-        if acc:
-            await _flush_usage(link_uid, conn_id, acc)
 
 @app.websocket("/ws/{uuid}")
 async def websocket_tunnel(websocket: WebSocket, uuid: str):
@@ -1401,25 +1380,28 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
             link_ip_map[uuid].add(client_ip)
 
         size = len(first_chunk)
+        stats["total_bytes"] += size
         stats["total_requests"] += 1
-        await _flush_usage(uuid, conn_id, size)
+        async with connections_lock:
+            if conn_id in connections:
+                connections[conn_id]["bytes"] += size
+        hourly_traffic[datetime.now(timezone.utc).strftime("%H:00")] += size
+        daily_traffic[datetime.now(timezone.utc).strftime("%Y-%m-%d")] += size
+        await add_usage(uuid, size)
 
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(address, port), timeout=10.0
         )
-        # Disable Nagle's algorithm: send small packets immediately instead of
-        # buffering — critical for interactive/low-latency proxy traffic.
-        sock = writer.transport.get_extra_info("socket")
-        if sock is not None:
-            import socket as _socket
-            try:
-                sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
-            except Exception:
-                pass
 
         if initial_payload:
             p_size = len(initial_payload)
-            await _flush_usage(uuid, conn_id, p_size)
+            stats["total_bytes"] += p_size
+            async with connections_lock:
+                if conn_id in connections:
+                    connections[conn_id]["bytes"] += p_size
+            hourly_traffic[datetime.now(timezone.utc).strftime("%H:00")] += p_size
+            daily_traffic[datetime.now(timezone.utc).strftime("%Y-%m-%d")] += p_size
+            await add_usage(uuid, p_size)
             try:
                 writer.write(initial_payload)
                 await writer.drain()   # safe drain
