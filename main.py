@@ -2626,7 +2626,7 @@ body{font-family:'Inter',sans-serif;color:var(--text);display:flex;flex-directio
   <div class="mo-box">
     <button class="mo-close" onclick="document.getElementById('mo-domain').classList.remove('show')">✕</button>
     <div class="mo-title">ADD DOMAIN</div>
-    <div class="fg"><label class="fl">Domain (without https://)</label><input class="fi" id="nd" placeholder="example.com" style="font-family:monospace"></div>
+    <div class="fg"><label class="fl">Domain (without https://)</label><input class="fi" id="domain-input" placeholder="example.com" style="font-family:monospace"></div>
     <button class="btn btn-gold" onclick="addDomain()" style="width:100%;justify-content:center;margin-top:12px;padding:12px;">ADD DOMAIN</button>
   </div>
 </div>
@@ -3432,12 +3432,12 @@ function renderDomains(){
 }
 
 function showAddDomainMo(){
-  $m('nd').value='';
+  $m('domain-input').value='';
   $m('mo-domain').classList.add('show');
 }
 
 async function addDomain(){
-  const domain=($m('nd').value||'').trim();
+  const domain=($m('domain-input').value||'').trim();
   if(!domain){toast('Domain is required',true);return;}
   try{
     const r=await fetch('/api/domains',{
