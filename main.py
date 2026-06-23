@@ -44,6 +44,7 @@ connections_lock = asyncio.Lock()          # lock for connections
 connection_sockets: dict = {}
 link_ip_map: dict = defaultdict(set)
 SHARE_TOKENS: dict = {}   # token -> {uid, created_at, expires_at, used}
+ORDERS: dict = {}        # order_id -> {label, gb, days, status, uid, created_at}
 stats = {"total_bytes": 0, "total_requests": 0, "total_errors": 0, "start_time": time.time()}
 error_logs: deque = deque(maxlen=50)
 hourly_traffic: dict = defaultdict(int)
@@ -56,6 +57,9 @@ GROUPS: dict = {}          # group_id -> {id, name, limit_bytes, created_at, not
 GROUPS_LOCK = asyncio.Lock()
 CUSTOM_ADDRESSES: list = ["www.speedtest.net"]
 CUSTOM_ADDRESSES_LOCK = asyncio.Lock()
+
+CUSTOM_DOMAINS: list = []   # دامنه‌های اضافی برای ساخت کانفیگ
+CUSTOM_DOMAINS_LOCK = asyncio.Lock()
 
 SESSION_COOKIE = "ren_session"
 SESSION_TTL = 60 * 60 * 24 * 7
@@ -86,6 +90,7 @@ def db_init():
         notified_quota INTEGER DEFAULT 0
     )""")
     conn.execute("CREATE TABLE IF NOT EXISTS addresses (address TEXT PRIMARY KEY)")
+    conn.execute("CREATE TABLE IF NOT EXISTS domains (domain TEXT PRIMARY KEY)")
     conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
     conn.commit()
     conn.close()
@@ -109,9 +114,10 @@ def db_load_all():
             "created_at": row["created_at"], "notified_quota": bool(row["notified_quota"]),
         }
     addresses = [r["address"] for r in conn.execute("SELECT address FROM addresses")]
+    domains = [r["domain"] for r in conn.execute("SELECT domain FROM domains")]
     settings = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings")}
     conn.close()
-    return links, groups, addresses, settings
+    return links, groups, addresses, domains, settings
 
 async def db_save_link(uid: str, link: dict):
     async with DB_LOCK:
@@ -174,6 +180,20 @@ async def db_delete_address(address: str):
         conn.commit()
         conn.close()
 
+async def db_save_domain(domain: str):
+    async with DB_LOCK:
+        conn = _db_conn()
+        conn.execute("INSERT OR IGNORE INTO domains (domain) VALUES (?)", (domain,))
+        conn.commit()
+        conn.close()
+
+async def db_delete_domain(domain: str):
+    async with DB_LOCK:
+        conn = _db_conn()
+        conn.execute("DELETE FROM domains WHERE domain=?", (domain,))
+        conn.commit()
+        conn.close()
+
 async def db_save_setting(key: str, value: str):
     async with DB_LOCK:
         conn = _db_conn()
@@ -206,6 +226,408 @@ async def telegram_notify(text: str):
             )
     except Exception:
         pass
+
+async def telegram_notify_with_buttons(text: str, buttons: list):
+    """buttons: list of {text, callback_data} rendered as one row of inline buttons."""
+    token, chat_id = CONFIG["tg_token"], CONFIG["tg_chat_id"]
+    if not token or not chat_id:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={
+                    "chat_id": chat_id, "text": text, "parse_mode": "HTML",
+                    "reply_markup": {"inline_keyboard": [buttons]},
+                }
+            )
+            return r.json()
+    except Exception:
+        return None
+
+async def telegram_edit_message(chat_id, message_id, text: str):
+    token = CONFIG["tg_token"]
+    if not token:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{token}/editMessageText",
+                json={"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML"}
+            )
+    except Exception:
+        pass
+
+async def telegram_answer_callback(callback_id: str, text: str = ""):
+    token = CONFIG["tg_token"]
+    if not token:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{token}/answerCallbackQuery",
+                json={"callback_query_id": callback_id, "text": text}
+            )
+    except Exception:
+        pass
+
+ADMIN_STATE: dict = {"awaiting": None}   # simple single-admin conversation state
+
+def _tg_main_menu():
+    return [
+        [{"text": "📋 List Users", "callback_data": "menu:list"}, {"text": "➕ Add User", "callback_data": "menu:add"}],
+        [{"text": "🛒 Pending Orders", "callback_data": "menu:orders"}, {"text": "📊 Stats", "callback_data": "menu:stats"}],
+        [{"text": "🌐 Addresses", "callback_data": "menu:addr"}, {"text": "📅 Daily Report", "callback_data": "menu:report"}],
+    ]
+
+async def build_daily_report() -> str:
+    async with LINKS_LOCK:
+        items = list(LINKS.items())
+    total_users = len(items)
+    active_users = sum(1 for _, l in items if l["active"])
+    total_used = sum(l["used_bytes"] for _, l in items)
+    near_quota = []
+    near_expiry = []
+    for uid, l in items:
+        if l["limit_bytes"] > 0:
+            pct = l["used_bytes"] / l["limit_bytes"] * 100
+            if pct >= 80:
+                near_quota.append((l["label"], round(pct)))
+        secs = seconds_until_expiry(l.get("expires_at"))
+        if secs is not None and 0 < secs <= 3 * 86400:
+            near_expiry.append((l["label"], secs // 86400))
+    cpu = psutil.cpu_percent(interval=0.1)
+    mem = psutil.virtual_memory().percent
+    lines = [
+        "📅 <b>Daily Report</b>",
+        "",
+        f"👥 Users: {total_users} total, {active_users} active",
+        f"📊 Total traffic: {_fmt_bytes(total_used)}",
+        f"🖥 CPU: {cpu}% · RAM: {mem}%",
+    ]
+    if near_quota:
+        lines.append("")
+        lines.append("⚠️ <b>Near quota (≥80%)</b>")
+        for label, pct in near_quota[:10]:
+            lines.append(f"• {label} — {pct}%")
+    if near_expiry:
+        lines.append("")
+        lines.append("⏳ <b>Expiring soon (≤3 days)</b>")
+        for label, days in near_expiry[:10]:
+            lines.append(f"• {label} — {days}d left")
+    if not near_quota and not near_expiry:
+        lines.append("")
+        lines.append("✅ No users near quota or expiry.")
+    return "\n".join(lines)
+
+async def daily_report_scheduler():
+    """Sends an automatic daily report to the admin every 24h (first run ~1 min after startup)."""
+    await asyncio.sleep(60)
+    while True:
+        if CONFIG["tg_token"] and CONFIG["tg_chat_id"]:
+            try:
+                text = await build_daily_report()
+                await telegram_notify(text)
+            except Exception:
+                logger.exception("daily report send failed")
+        await asyncio.sleep(86400)
+
+async def telegram_send_keyboard(chat_id, text: str, rows: list):
+    token = CONFIG["tg_token"]
+    if not token:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML", "reply_markup": {"inline_keyboard": rows}}
+            )
+    except Exception:
+        pass
+
+async def telegram_edit_keyboard(chat_id, message_id, text: str, rows: list):
+    token = CONFIG["tg_token"]
+    if not token:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{token}/editMessageText",
+                json={"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML", "reply_markup": {"inline_keyboard": rows}}
+            )
+    except Exception:
+        pass
+
+def _user_detail_text(uid: str, link: dict) -> str:
+    used_str = _fmt_bytes(link["used_bytes"])
+    limit_str = "∞" if link["limit_bytes"] == 0 else _fmt_bytes(link["limit_bytes"])
+    status = "🟢 Active" if link["active"] else "🔴 Inactive"
+    exp = link.get("expires_at")
+    exp_str = "Never" if not exp else exp[:10]
+    return f"<b>{link['label']}</b>\n\n{status}\nData: {used_str} / {limit_str}\nExpires: {exp_str}\nMax devices: {link.get('max_connections') or '∞'}"
+
+def _user_detail_buttons(uid: str, link: dict):
+    toggle_label = "🔴 Turn Off" if link["active"] else "🟢 Turn On"
+    return [
+        [{"text": toggle_label, "callback_data": f"tgl:{uid}"}, {"text": "🔄 Reset Usage", "callback_data": f"rst:{uid}"}],
+        [{"text": "🔗 Share Link", "callback_data": f"shr:{uid}"}, {"text": "🗑 Delete", "callback_data": f"delc:{uid}"}],
+        [{"text": "« Back to list", "callback_data": "menu:list"}],
+    ]
+
+async def _handle_bot_message(chat_id, text: str):
+    text = (text or "").strip()
+    if text in ("/start", "/menu"):
+        ADMIN_STATE["awaiting"] = None
+        await telegram_send_keyboard(chat_id, "👋 <b>Meiteeam Admin Bot</b>\nChoose an action:", _tg_main_menu())
+        return
+    if ADMIN_STATE.get("awaiting") == "add":
+        parts = [p.strip() for p in text.split(",")]
+        if len(parts) < 1 or not parts[0]:
+            await telegram_notify("Format: <code>Label, GB, Days</code> — e.g. <code>John, 50, 30</code>")
+            return
+        label = parts[0][:60]
+        try:
+            gb = float(parts[1]) if len(parts) > 1 and parts[1] else 0
+            days = int(parts[2]) if len(parts) > 2 and parts[2] else 0
+        except ValueError:
+            await telegram_notify("GB and Days must be numbers. Try again: <code>Label, GB, Days</code>")
+            return
+        if not re.match(r'^[a-zA-Z0-9\-_. ]+$', label):
+            await telegram_notify("Label must contain only English letters, numbers, - _ . and spaces.")
+            return
+        order = {"label": label, "gb": gb, "days": days}
+        uid = await _provision_order(order)
+        ADMIN_STATE["awaiting"] = None
+        vless_link = generate_vless_link(uid, remark=f"Meiteeam-{label}")
+        sub_url = f"https://{get_domain()}/sub/{uid}"
+        await telegram_notify(f"✅ Created <b>{label}</b>\n\nSub URL:\n<code>{sub_url}</code>\n\nConfig:\n<code>{vless_link}</code>")
+        await telegram_send_keyboard(chat_id, "What next?", _tg_main_menu())
+        return
+    await telegram_send_keyboard(chat_id, "Not sure what you mean — use the menu below.", _tg_main_menu())
+
+async def _handle_bot_callback(cq: dict):
+    from_id = str(cq.get("from", {}).get("id", ""))
+    cdata = cq.get("data", "")
+    msg = cq.get("message", {})
+    chat_id = msg.get("chat", {}).get("id")
+    message_id = msg.get("message_id")
+    admin_id = CONFIG["tg_chat_id"]
+    if from_id != str(admin_id):
+        await telegram_answer_callback(cq["id"], "Not authorized")
+        return
+    if ":" not in cdata:
+        await telegram_answer_callback(cq["id"])
+        return
+    action, arg = cdata.split(":", 1)
+
+    if action == "menu":
+        await telegram_answer_callback(cq["id"])
+        if arg == "list":
+            async with LINKS_LOCK:
+                items = list(LINKS.items())
+            if not items:
+                await telegram_edit_keyboard(chat_id, message_id, "No users yet.", [[{"text": "« Back", "callback_data": "menu:back"}]])
+                return
+            rows = [[{"text": f"{('🟢' if l['active'] else '🔴')} {l['label']}", "callback_data": f"user:{uid}"}] for uid, l in items[:50]]
+            rows.append([{"text": "« Back", "callback_data": "menu:back"}])
+            await telegram_edit_keyboard(chat_id, message_id, f"<b>Users</b> ({len(items)})", rows)
+        elif arg == "add":
+            ADMIN_STATE["awaiting"] = "add"
+            await telegram_edit_keyboard(chat_id, message_id, "Send the new user as:\n<code>Label, GB, Days</code>\n\ne.g. <code>John, 50, 30</code> (0 = unlimited)", [[{"text": "« Cancel", "callback_data": "menu:back"}]])
+        elif arg == "orders":
+            pending = [(oid, o) for oid, o in ORDERS.items() if o["status"] == "pending"]
+            if not pending:
+                await telegram_edit_keyboard(chat_id, message_id, "No pending orders.", [[{"text": "« Back", "callback_data": "menu:back"}]])
+                return
+            rows = [[{"text": f"🛒 {o['label']} ({o['gb']}GB/{o['days']}d)", "callback_data": f"ord:{oid}"}] for oid, o in pending[:30]]
+            rows.append([{"text": "« Back", "callback_data": "menu:back"}])
+            await telegram_edit_keyboard(chat_id, message_id, f"<b>Pending Orders</b> ({len(pending)})", rows)
+        elif arg == "stats":
+            async with LINKS_LOCK:
+                count = len(LINKS)
+                total_used = sum(l["used_bytes"] for l in LINKS.values())
+            cpu = psutil.cpu_percent(interval=0.1)
+            mem = psutil.virtual_memory().percent
+            text = f"<b>📊 Stats</b>\n\nUsers: {count}\nTotal traffic: {_fmt_bytes(total_used)}\nCPU: {cpu}%\nMemory: {mem}%"
+            await telegram_edit_keyboard(chat_id, message_id, text, [[{"text": "« Back", "callback_data": "menu:back"}]])
+        elif arg == "addr":
+            addrs = "\n".join(f"• {a}" for a in CUSTOM_ADDRESSES) or "No clean IPs configured."
+            await telegram_edit_keyboard(chat_id, message_id, f"<b>🌐 Clean IPs</b>\n\n{addrs}", [[{"text": "« Back", "callback_data": "menu:back"}]])
+        elif arg == "report":
+            text = await build_daily_report()
+            await telegram_edit_keyboard(chat_id, message_id, text, [[{"text": "« Back", "callback_data": "menu:back"}]])
+        elif arg == "back":
+            ADMIN_STATE["awaiting"] = None
+            await telegram_edit_keyboard(chat_id, message_id, "👋 <b>Meiteeam Admin Bot</b>\nChoose an action:", _tg_main_menu())
+        return
+
+    if action == "user":
+        await telegram_answer_callback(cq["id"])
+        async with LINKS_LOCK:
+            link = LINKS.get(arg)
+        if not link:
+            await telegram_edit_keyboard(chat_id, message_id, "User not found.", [[{"text": "« Back", "callback_data": "menu:list"}]])
+            return
+        await telegram_edit_keyboard(chat_id, message_id, _user_detail_text(arg, link), _user_detail_buttons(arg, link))
+        return
+
+    if action == "tgl":
+        async with LINKS_LOCK:
+            link = LINKS.get(arg)
+            if link:
+                link["active"] = not link["active"]
+                link_copy = dict(link)
+        if link:
+            await db_save_link(arg, link_copy)
+            await telegram_answer_callback(cq["id"], "Toggled")
+            await telegram_edit_keyboard(chat_id, message_id, _user_detail_text(arg, link_copy), _user_detail_buttons(arg, link_copy))
+        else:
+            await telegram_answer_callback(cq["id"], "Not found")
+        return
+
+    if action == "rst":
+        async with LINKS_LOCK:
+            link = LINKS.get(arg)
+            if link:
+                link["used_bytes"] = 0
+                link["notified_quota"] = False
+                link_copy = dict(link)
+        if link:
+            await db_save_link(arg, link_copy)
+            await telegram_answer_callback(cq["id"], "Usage reset")
+            await telegram_edit_keyboard(chat_id, message_id, _user_detail_text(arg, link_copy), _user_detail_buttons(arg, link_copy))
+        else:
+            await telegram_answer_callback(cq["id"], "Not found")
+        return
+
+    if action == "shr":
+        async with LINKS_LOCK:
+            exists = arg in LINKS
+        if not exists:
+            await telegram_answer_callback(cq["id"], "Not found")
+            return
+        for tok, info in list(SHARE_TOKENS.items()):
+            if info["expires_at"] < time.time():
+                SHARE_TOKENS.pop(tok, None)
+        token = secrets.token_urlsafe(24)
+        SHARE_TOKENS[token] = {"uid": arg, "created_at": time.time(), "expires_at": time.time() + 86400, "used": False}
+        await telegram_answer_callback(cq["id"], "Link sent below")
+        await telegram_notify(f"🔗 One-time share link for <b>{arg}</b>:\nhttps://{get_domain()}/share/{token}")
+        return
+
+    if action == "delc":
+        await telegram_answer_callback(cq["id"])
+        await telegram_edit_keyboard(chat_id, message_id, f"Delete <b>{arg}</b>? This cannot be undone.", [
+            [{"text": "✅ Yes, delete", "callback_data": f"delx:{arg}"}, {"text": "« Cancel", "callback_data": f"user:{arg}"}],
+        ])
+        return
+
+    if action == "delx":
+        async with LINKS_LOCK:
+            LINKS.pop(arg, None)
+        await close_connections_for_link(arg)
+        await db_delete_link(arg)
+        await telegram_answer_callback(cq["id"], "Deleted")
+        await telegram_edit_keyboard(chat_id, message_id, f"🗑 Deleted <b>{arg}</b>.", [[{"text": "« Back to list", "callback_data": "menu:list"}]])
+        return
+
+    if action == "ord":
+        order = ORDERS.get(arg)
+        if not order or order["status"] != "pending":
+            await telegram_answer_callback(cq["id"], "Not available")
+            return
+        await telegram_answer_callback(cq["id"])
+        gb_str = "Unlimited" if order["gb"] <= 0 else f"{order['gb']}GB"
+        days_str = "No expiry" if order["days"] <= 0 else f"{order['days']} days"
+        text = f"🛒 <b>{order['label']}</b>\n{gb_str} / {days_str}"
+        if order.get("note"):
+            text += f"\nNote: {order['note']}"
+        await telegram_edit_keyboard(chat_id, message_id, text, [
+            [{"text": "✅ Approve", "callback_data": f"appr:{arg}"}, {"text": "❌ Reject", "callback_data": f"rej:{arg}"}],
+            [{"text": "« Back", "callback_data": "menu:orders"}],
+        ])
+        return
+
+    if action in ("appr", "rej"):
+        order_id = arg
+        order = ORDERS.get(order_id)
+        if order is None:
+            await telegram_answer_callback(cq["id"], "Order not found")
+            return
+        if order["status"] != "pending":
+            await telegram_answer_callback(cq["id"], "Already handled")
+            return
+        if action == "appr":
+            uid = await _provision_order(order)
+            order["status"] = "approved"
+            order["uid"] = uid
+            await telegram_answer_callback(cq["id"], "Approved ✅")
+            await telegram_edit_keyboard(chat_id, message_id, f"✅ Approved — <b>{order['label']}</b> ({order['gb']}GB / {order['days']}d) is live.", [[{"text": "« Menu", "callback_data": "menu:back"}]])
+        else:
+            order["status"] = "rejected"
+            await telegram_answer_callback(cq["id"], "Rejected ❌")
+            await telegram_edit_keyboard(chat_id, message_id, f"❌ Rejected — <b>{order['label']}</b> request.", [[{"text": "« Menu", "callback_data": "menu:back"}]])
+        return
+
+    await telegram_answer_callback(cq["id"])
+
+async def order_telegram_poller():
+    """Long-polls Telegram for the admin bot menu, user management buttons, and order approvals."""
+    offset = 0
+    while True:
+        token, admin_id = CONFIG["tg_token"], CONFIG["tg_chat_id"]
+        if not token or not admin_id:
+            await asyncio.sleep(10)
+            continue
+        try:
+            async with httpx.AsyncClient(timeout=35.0) as client:
+                r = await client.get(
+                    f"https://api.telegram.org/bot{token}/getUpdates",
+                    params={"offset": offset, "timeout": 25, "allowed_updates": '["callback_query","message"]'}
+                )
+                data = r.json()
+        except Exception:
+            await asyncio.sleep(5)
+            continue
+        for update in data.get("result", []):
+            offset = update["update_id"] + 1
+            cq = update.get("callback_query")
+            if cq:
+                try:
+                    await _handle_bot_callback(cq)
+                except Exception:
+                    logger.exception("telegram callback handling failed")
+                continue
+            msg = update.get("message")
+            if msg:
+                from_id = str(msg.get("from", {}).get("id", ""))
+                if from_id != str(admin_id):
+                    continue
+                try:
+                    await _handle_bot_message(msg.get("chat", {}).get("id"), msg.get("text", ""))
+                except Exception:
+                    logger.exception("telegram message handling failed")
+
+async def _provision_order(order: dict) -> str:
+    """Creates the actual inbound for an approved order. Returns the uid."""
+    label = order["label"]
+    async with LINKS_LOCK:
+        uid = label
+        n = 2
+        while uid in LINKS:
+            uid = f"{label}-{n}"
+            n += 1
+        limit_bytes = 0 if order["gb"] <= 0 else parse_size_to_bytes(order["gb"], "GB")
+        expires_at = None
+        if order["days"] > 0:
+            expires_at = (datetime.now(timezone.utc) + timedelta(days=order["days"])).isoformat()
+        LINKS[uid] = {
+            "label": uid, "limit_bytes": limit_bytes, "used_bytes": 0,
+            "max_connections": 0, "created_at": datetime.now(timezone.utc).isoformat(),
+            "active": True, "expires_at": expires_at, "group_id": None,
+        }
+    await db_save_link(uid, LINKS[uid])
+    return uid
 
 async def quota_expiry_watcher():
     """Checks every 5 minutes for links nearing quota/expiry and sends a one-time Telegram alert."""
@@ -325,7 +747,7 @@ async def startup():
     http_client = httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=True)
 
     db_init()
-    saved_links, saved_groups, saved_addresses, saved_settings = db_load_all()
+    saved_links, saved_groups, saved_addresses, saved_domains, saved_settings = db_load_all()
     if saved_links:
         async with LINKS_LOCK:
             LINKS.update(saved_links)
@@ -336,6 +758,10 @@ async def startup():
         async with CUSTOM_ADDRESSES_LOCK:
             CUSTOM_ADDRESSES.clear()
             CUSTOM_ADDRESSES.extend(saved_addresses)
+    if saved_domains:
+        async with CUSTOM_DOMAINS_LOCK:
+            CUSTOM_DOMAINS.clear()
+            CUSTOM_DOMAINS.extend(saved_domains)
     if "password_hash" in saved_settings:
         AUTH["password_hash"] = saved_settings["password_hash"]
     elif os.environ.get("ADMIN_PASSWORD"):
@@ -344,6 +770,8 @@ async def startup():
     asyncio.create_task(keep_alive())
     asyncio.create_task(flush_usage_to_db())
     asyncio.create_task(quota_expiry_watcher())
+    asyncio.create_task(order_telegram_poller())
+    asyncio.create_task(daily_report_scheduler())
     await ensure_default_link()
 
 @app.on_event("shutdown")
@@ -353,8 +781,11 @@ async def shutdown():
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def get_domain() -> str:
+    # اگه CUSTOM_DOMAIN تنظیم شده باشه اولویت داره، بعد Railway، بعد Render
     return (
-        os.environ.get("RENDER_EXTERNAL_URL", os.environ.get("RAILWAY_PUBLIC_DOMAIN", "localhost"))
+        os.environ.get("CUSTOM_DOMAIN",
+            os.environ.get("RENDER_EXTERNAL_URL",
+                os.environ.get("RAILWAY_PUBLIC_DOMAIN", "localhost")))
         .replace("https://", "").replace("http://", "")
     )
 
@@ -367,8 +798,22 @@ def generate_uuid(seed: str | None = None) -> str:
     h = hashlib.sha256(f"{seed}{CONFIG['secret']}".encode()).hexdigest()
     return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
 
-def generate_vless_link(uuid: str, remark: str = "meiteeam", address: str = None) -> str:
-    domain = get_domain()
+def get_all_domains() -> list:
+    """همه دامنه‌ها رو برمیگردونه — اول دامنه اصلی، بعد دامنه‌های اضافی."""
+    primary = get_domain()
+    extras = list(CUSTOM_DOMAINS)
+    # دامنه‌های تکراری رو حذف کن
+    seen = {primary}
+    result = [primary]
+    for d in extras:
+        d = d.replace("https://", "").replace("http://", "").strip()
+        if d and d not in seen:
+            seen.add(d)
+            result.append(d)
+    return result
+
+def generate_vless_link(uuid: str, remark: str = "meiteeam", address: str = None, domain_override: str = None) -> str:
+    domain = domain_override if domain_override else get_domain()
     addr = address if address else domain
     path = f"/ws/{uuid}"
     params = {
@@ -377,6 +822,14 @@ def generate_vless_link(uuid: str, remark: str = "meiteeam", address: str = None
     }
     query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
     return f"vless://{uuid}@{addr}:443?{query}#{quote(remark)}"
+
+def generate_all_domain_links(uuid: str, label: str) -> list:
+    """به ازای هر دامنه یه کانفیگ جداگانه میسازه."""
+    links = []
+    for i, domain in enumerate(get_all_domains()):
+        suffix = "" if i == 0 else f"-D{i}"
+        links.append(generate_vless_link(uuid, remark=f"meiteeam-{label}{suffix}", domain_override=domain))
+    return links
 
 def uptime() -> str:
     secs = int(time.time() - stats["start_time"])
@@ -868,6 +1321,38 @@ async def delete_address(index: int, _=Depends(require_auth)):
     await db_delete_address(removed)
     return {"ok": True, "addresses": list(CUSTOM_ADDRESSES)}
 
+@app.get("/api/domains")
+async def list_domains(_=Depends(require_auth)):
+    async with CUSTOM_DOMAINS_LOCK:
+        return {"primary": get_domain(), "domains": list(CUSTOM_DOMAINS)}
+
+@app.post("/api/domains")
+async def add_domain(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    domain = (body.get("domain") or "").strip().replace("https://", "").replace("http://", "").rstrip("/")
+    if not domain:
+        raise HTTPException(status_code=400, detail="Domain is required")
+    if not re.match(r'^[a-zA-Z0-9\-_.]+$', domain):
+        raise HTTPException(status_code=400, detail="Invalid domain format")
+    async with CUSTOM_DOMAINS_LOCK:
+        if domain in CUSTOM_DOMAINS:
+            raise HTTPException(status_code=400, detail="Domain already exists")
+        if domain == get_domain():
+            raise HTTPException(status_code=400, detail="This is already the primary domain")
+        CUSTOM_DOMAINS.append(domain)
+    await db_save_domain(domain)
+    return {"ok": True, "domains": list(CUSTOM_DOMAINS)}
+
+@app.delete("/api/domains/{index}")
+async def delete_domain(index: int, _=Depends(require_auth)):
+    async with CUSTOM_DOMAINS_LOCK:
+        if 0 <= index < len(CUSTOM_DOMAINS):
+            removed = CUSTOM_DOMAINS.pop(index)
+        else:
+            raise HTTPException(status_code=404, detail="Domain not found")
+    await db_delete_domain(removed)
+    return {"ok": True, "domains": list(CUSTOM_DOMAINS)}
+
 @app.get("/api/backup")
 async def export_backup(_=Depends(require_auth)):
     """Full JSON export of inbounds + groups + addresses, downloadable for safekeeping."""
@@ -1017,7 +1502,11 @@ def generate_subscription_content(link: dict, uid: str, addresses: list[str]) ->
     else:
         expiry_str = f"{secs_left // 86400} Days Left"
     status_node = generate_vless_link(uid, remark=f"📊 {usage_str} | ⏳ {expiry_str}", address="0.0.0.0")
-    links_out = [status_node, generate_vless_link(uid, remark=f"meiteeam-{link['label']}-Server")]
+    links_out = [status_node]
+    # کانفیگ برای همه دامنه‌ها
+    for domain_link in generate_all_domain_links(uid, link['label']):
+        links_out.append(domain_link)
+    # کانفیگ برای IP های اضافی
     for i, addr in enumerate(addresses):
         links_out.append(generate_vless_link(uid, remark=f"meiteeam-{link['label']}-IP{i+1}", address=addr))
     return "\n".join(links_out)
@@ -1097,6 +1586,138 @@ async def create_share_link(uid: str, _=Depends(require_auth)):
     token = secrets.token_urlsafe(24)
     SHARE_TOKENS[token] = {"uid": uid, "created_at": time.time(), "expires_at": time.time() + 86400, "used": False}
     return {"ok": True, "share_url": f"https://{get_domain()}/share/{token}"}
+
+@app.post("/order/api/submit")
+async def submit_order(request: Request):
+    body = await request.json()
+    label = (body.get("label") or "").strip()[:40]
+    if not label or not re.match(r'^[a-zA-Z0-9\-_. ]+$', label):
+        raise HTTPException(status_code=400, detail="Name must contain only English letters, numbers, and characters: - _ . space")
+    try:
+        gb = float(body.get("gb") or 0)
+        days = int(body.get("days") or 0)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid traffic or duration value")
+    if gb < 0 or gb > 10000 or days < 0 or days > 3650:
+        raise HTTPException(status_code=400, detail="Value out of allowed range")
+    note = (body.get("note") or "").strip()[:200]
+    order_id = secrets.token_urlsafe(10)
+    ORDERS[order_id] = {
+        "label": label, "gb": gb, "days": days, "note": note,
+        "status": "pending", "uid": None, "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    gb_str = "Unlimited" if gb <= 0 else f"{gb}GB"
+    days_str = "No expiry" if days <= 0 else f"{days} days"
+    text = f"🛒 <b>New order request</b>\n\n<b>Name:</b> {label}\n<b>Traffic:</b> {gb_str}\n<b>Duration:</b> {days_str}"
+    if note:
+        text += f"\n<b>Note:</b> {note}"
+    await telegram_notify_with_buttons(text, [
+        {"text": "✅ Approve", "callback_data": f"appr:{order_id}"},
+        {"text": "❌ Reject", "callback_data": f"rej:{order_id}"},
+    ])
+    return {"ok": True, "order_id": order_id}
+
+@app.get("/order/api/status/{order_id}")
+async def order_status(order_id: str):
+    order = ORDERS.get(order_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail="Order not found")
+    out = {"status": order["status"], "label": order["label"]}
+    if order["status"] == "approved" and order["uid"]:
+        uid = order["uid"]
+        async with LINKS_LOCK:
+            link = LINKS.get(uid)
+        if link:
+            out["vless_link"] = generate_vless_link(uid, remark=f"Meiteeam-{link['label']}")
+            out["sub_url"] = f"https://{get_domain()}/sub/{uid}"
+    return out
+
+@app.get("/order", response_class=HTMLResponse)
+async def order_page():
+    body = """
+        <div class="mono">M</div>
+        <h1>Request a Config</h1>
+        <p>Fill in what you need below. An admin will review and approve your request shortly.</p>
+        <div style="margin-top:18px">
+          <label style="font-size:10.5px;color:var(--text3);text-transform:uppercase;letter-spacing:.06em">Your Name</label>
+          <input id="o-label" type="text" placeholder="e.g. John" style="width:100%;margin-top:5px;padding:10px 12px;background:var(--surface3);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:inherit;font-size:13px">
+        </div>
+        <div style="margin-top:14px;display:flex;gap:10px">
+          <div style="flex:1">
+            <label style="font-size:10.5px;color:var(--text3);text-transform:uppercase;letter-spacing:.06em">Traffic (GB)</label>
+            <input id="o-gb" type="number" min="0" step=".5" placeholder="0 = unlimited" style="width:100%;margin-top:5px;padding:10px 12px;background:var(--surface3);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:inherit;font-size:13px">
+          </div>
+          <div style="flex:1">
+            <label style="font-size:10.5px;color:var(--text3);text-transform:uppercase;letter-spacing:.06em">Duration (days)</label>
+            <input id="o-days" type="number" min="0" placeholder="0 = unlimited" style="width:100%;margin-top:5px;padding:10px 12px;background:var(--surface3);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:inherit;font-size:13px">
+          </div>
+        </div>
+        <div style="margin-top:14px">
+          <label style="font-size:10.5px;color:var(--text3);text-transform:uppercase;letter-spacing:.06em">Note (optional)</label>
+          <input id="o-note" type="text" placeholder="Anything the admin should know" style="width:100%;margin-top:5px;padding:10px 12px;background:var(--surface3);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:inherit;font-size:13px">
+        </div>
+        <button class="copybtn" id="o-submit" onclick="submitOrder()">Submit Request</button>
+        <div id="o-err" style="color:var(--red);font-size:12px;margin-top:10px;display:none"></div>
+    """
+    html = _public_page("Request a Config", body)
+    html = html.replace("</script>", """
+async function submitOrder(){
+  const btn=document.getElementById('o-submit');
+  const err=document.getElementById('o-err');
+  err.style.display='none';
+  const label=document.getElementById('o-label').value.trim();
+  const gb=document.getElementById('o-gb').value||0;
+  const days=document.getElementById('o-days').value||0;
+  const note=document.getElementById('o-note').value.trim();
+  if(!label){err.textContent='Please enter your name.';err.style.display='block';return;}
+  btn.disabled=true;btn.textContent='Submitting...';
+  try{
+    const r=await fetch('/order/api/submit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label,gb,days,note})});
+    const d=await r.json();
+    if(!r.ok)throw new Error(d.detail||'Error submitting request');
+    location.href='/order/status/'+d.order_id;
+  }catch(e){
+    err.textContent=e.message||'Error submitting request';
+    err.style.display='block';
+    btn.disabled=false;btn.textContent='Submit Request';
+  }
+}
+</script>""")
+    return HTMLResponse(html)
+
+@app.get("/order/status/{order_id}", response_class=HTMLResponse)
+async def order_status_page(order_id: str):
+    order = ORDERS.get(order_id)
+    if order is None:
+        return HTMLResponse(_public_page("Not Found", '<div class="mono">!</div><h1>Order not found</h1><p>This request does not exist or has expired.</p>'), status_code=404)
+    if order["status"] == "pending":
+        body = f"""
+            <div class="mono">M</div>
+            <h1>{order['label']}</h1>
+            <p>Your request is waiting for admin approval. This page refreshes automatically — keep it open.</p>
+            <div class="row"><span>Status</span><span class="tag" style="color:var(--yellow)">Pending</span></div>
+        """
+        html = _public_page("Order Pending", body)
+        html = html.replace("</script>", "setTimeout(()=>location.reload(),5000);\n</script>")
+        return HTMLResponse(html)
+    if order["status"] == "rejected":
+        return HTMLResponse(_public_page("Request Rejected", f'<div class="mono">!</div><h1>{order["label"]}</h1><p>Your request was not approved. Please contact the admin for details.</p>'))
+    uid = order["uid"]
+    async with LINKS_LOCK:
+        link = LINKS.get(uid) if uid else None
+    if link is None:
+        return HTMLResponse(_public_page("Not Found", '<div class="mono">!</div><h1>Config not found</h1><p>This inbound no longer exists.</p>'))
+    vless_link = generate_vless_link(uid, remark=f"Meiteeam-{link['label']}")
+    sub_url = f"https://{get_domain()}/sub/{uid}"
+    body = f"""
+        <div class="mono">M</div>
+        <h1>{link['label']}</h1>
+        <p>Your request was approved! Save your config below.</p>
+        <div class="qr-box"><img src="https://api.qrserver.com/v1/create-qr-code/?size=240x240&data={quote(sub_url)}" alt="QR"></div>
+        <textarea id="cfgtxt" rows="3" readonly>{vless_link}</textarea>
+        <button class="copybtn" id="cpbtn" onclick="cp()">Copy Config</button>
+    """
+    return HTMLResponse(_public_page(f"{link['label']} · Approved", body))
 
 @app.get("/share/{token}", response_class=HTMLResponse)
 async def view_share_link(token: str):
@@ -1716,6 +2337,10 @@ body{font-family:'Inter',sans-serif;color:var(--text);display:flex;flex-directio
         <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/></svg>
         <span class="nav-label">Clean IP</span>
       </button>
+      <button class="nav-item" data-page="domains">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"/></svg>
+        <span class="nav-label">Domains</span>
+      </button>
       <button class="nav-item" data-page="security">
         <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
         <span class="nav-label">Security</span>
@@ -1843,13 +2468,32 @@ body{font-family:'Inter',sans-serif;color:var(--text);display:flex;flex-directio
         <div class="page-eyebrow">Routing</div>
         <div class="page-header-row">
           <div><div class="page-title">Clean IP</div><div class="page-sub">Subscription alternative addresses</div></div>
-          <button class="btn btn-gold" onclick="showAddAddrMo()">+ Add</button>
+          <div style="display:flex;gap:8px">
+            <button class="btn btn-ghost" onclick="pingAllAddrs()">⚡ Ping All</button>
+            <button class="btn btn-gold" onclick="showAddAddrMo()">+ Add</button>
+          </div>
         </div>
         <div class="page-rule"></div>
       </div>
       <div class="card">
         <div style="font-size:12px;color:var(--text3);margin-bottom:12px">Default: www.speedtest.net</div>
         <div id="addr-list"></div>
+      </div>
+    </section>
+
+    <!-- Domains -->
+    <section class="page" id="page-domains">
+      <div class="page-header">
+        <div class="page-eyebrow">Config Domains</div>
+        <div class="page-header-row">
+          <div><div class="page-title">Domains</div><div class="page-sub">دامنه‌های اضافی برای ساخت کانفیگ</div></div>
+          <button class="btn btn-gold" onclick="showAddDomainMo()">+ Add Domain</button>
+        </div>
+        <div class="page-rule"></div>
+      </div>
+      <div class="card">
+        <div style="font-size:12px;color:var(--text3);margin-bottom:12px">دامنه اصلی: <span id="primary-domain" style="font-family:monospace"></span></div>
+        <div id="domain-list"></div>
       </div>
     </section>
 
@@ -1981,6 +2625,15 @@ body{font-family:'Inter',sans-serif;color:var(--text);display:flex;flex-directio
   </div>
 </div>
 
+<div class="mo" id="mo-domain" onclick="if(event.target===this)this.classList.remove('show')">
+  <div class="mo-box">
+    <button class="mo-close" onclick="document.getElementById('mo-domain').classList.remove('show')">✕</button>
+    <div class="mo-title">ADD DOMAIN</div>
+    <div class="fg"><label class="fl">Domain (بدون https://)</label><input class="fi" id="nd" placeholder="example.com" style="font-family:monospace"></div>
+    <button class="btn btn-gold" onclick="addDomain()" style="width:100%;justify-content:center;margin-top:12px;padding:12px;">ADD DOMAIN</button>
+  </div>
+</div>
+
 <div class="mo" id="mo-group" onclick="if(event.target===this)this.classList.remove('show')">
   <div class="mo-box">
     <button class="mo-close" onclick="document.getElementById('mo-group').classList.remove('show')">✕</button>
@@ -2052,6 +2705,7 @@ function showDashboard(){
   loadLinks();
   loadAddrs();
   loadGroups();
+  loadDomains();
 }
 
 async function doLogin(){
@@ -2604,8 +3258,55 @@ function renderAddrs(){
       <span style="color:var(--accent);font-size:16px">🌐</span>
       <div><div style="font-size:14px;font-weight:600">${esc(a)}</div><div style="font-size:11px;color:var(--text3);margin-top:2px;">Address #${i+1}</div></div>
     </div>
-    <button class="act-btn act-del" onclick="delAddr(${i})">Del</button>
+    <div style="display:flex;align-items:center;gap:8px">
+      <span id="ping-${i}" style="font-family:'JetBrains Mono',monospace;font-size:11.5px;font-weight:600;color:var(--text3);min-width:58px;text-align:right">–</span>
+      <button class="act-btn act-copy" onclick="pingAddr('${esc(a)}',${i})">Ping</button>
+      <button class="act-btn act-del" onclick="delAddr(${i})">Del</button>
+    </div>
   </div>`).join('');
+  allAddrs.forEach((a,i)=>pingAddr(a,i));
+}
+
+function imgPing(url,timeoutMs){
+  return new Promise(resolve=>{
+    const img=new Image();
+    const t0=performance.now();
+    let done=false;
+    const finish=ok=>{
+      if(done)return;
+      done=true;
+      resolve(ok?performance.now()-t0:null);
+    };
+    img.onload=()=>finish(true);
+    img.onerror=()=>finish(true); // a fast error still proves the round trip completed
+    setTimeout(()=>finish(false),timeoutMs);
+    img.src=url+(url.includes('?')?'&':'?')+'_t='+Date.now()+Math.random();
+  });
+}
+
+async function pingAddr(host,i){
+  const el=$m('ping-'+i);
+  if(!el)return;
+  el.textContent='…';
+  el.style.color='var(--text3)';
+  const samples=[];
+  for(let n=0;n<4;n++){
+    const ms=await imgPing('https://www.google.com/favicon.ico',2500);
+    if(ms!==null)samples.push(ms);
+  }
+  if(!samples.length){
+    el.textContent='timeout';
+    el.style.color='var(--red)';
+    return;
+  }
+  samples.sort((a,b)=>a-b);
+  const ms=Math.round(samples[Math.floor(samples.length/2)]); // median, less noisy than min/max
+  el.textContent=ms+' ms';
+  el.style.color=ms<150?'var(--green)':ms<350?'var(--yellow)':'var(--red)';
+}
+
+async function pingAllAddrs(){
+  allAddrs.forEach((a,i)=>pingAddr(a,i));
 }
 
 function showAddAddrMo(){$m('na').value='';$m('mo-addr').classList.add('show');}
@@ -2744,13 +3445,79 @@ async function deleteGroupConfirm(gid){
   }catch(e){toast('Error deleting group',true);}
 }
 
+// ── Domains ───────────────────────────────────────────────────────────────────
+let allDomains=[];
+let primaryDomain='';
+
+async function loadDomains(){
+  try{
+    const r=await fetch('/api/domains');
+    if(!r.ok)throw new Error();
+    const d=await r.json();
+    allDomains=d.domains||[];
+    primaryDomain=d.primary||'';
+    renderDomains();
+  }catch(e){/* silent */}
+}
+
+function renderDomains(){
+  const el=$m('domain-list');
+  const pd=$m('primary-domain');
+  if(pd)pd.textContent=primaryDomain;
+  if(!el)return;
+  if(!allDomains.length){
+    el.innerHTML='<div style="color:var(--text3);font-size:12px;padding:8px 0">هنوز دامنه‌ای اضافه نشده — دامنه اضافه کن تا کانفیگ برای هر دو دامنه ساخته بشه.</div>';
+    return;
+  }
+  el.innerHTML=allDomains.map((d,i)=>`
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)">
+      <div style="font-family:monospace;font-size:13px">${esc(d)}</div>
+      <button class="act-btn act-del" onclick="delDomain(${i})">Del</button>
+    </div>
+  `).join('');
+}
+
+function showAddDomainMo(){
+  $m('nd').value='';
+  $m('mo-domain').classList.add('show');
+}
+
+async function addDomain(){
+  const domain=($m('nd').value||'').trim();
+  if(!domain){toast('Domain is required',true);return;}
+  try{
+    const r=await fetch('/api/domains',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({domain})
+    });
+    if(!r.ok){
+      const err=await r.json().catch(()=>({}));
+      throw new Error(err.detail||'failed');
+    }
+    toast('Domain added');
+    $m('mo-domain').classList.remove('show');
+    await loadDomains();
+  }catch(e){toast(e.message||'Error adding domain',true);}
+}
+
+async function delDomain(i){
+  if(!confirm('Delete this domain?'))return;
+  try{
+    const r=await fetch('/api/domains/'+i,{method:'DELETE'});
+    if(!r.ok)throw new Error();
+    toast('Deleted');
+    await loadDomains();
+  }catch(e){toast('Error deleting',true);}
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 setTheme(theme);
 checkAuth();
 let statsInterval=null;
 function startPolling(){
   if(statsInterval)clearInterval(statsInterval);
-  statsInterval=setInterval(()=>{if(isAuthenticated){loadStats();loadLinks();loadGroups();}},12000);
+  statsInterval=setInterval(()=>{if(isAuthenticated){loadStats();loadLinks();loadGroups();loadDomains();}},12000);
 }
 startPolling();
 </script>
