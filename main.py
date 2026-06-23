@@ -58,7 +58,7 @@ GROUPS_LOCK = asyncio.Lock()
 CUSTOM_ADDRESSES: list = ["www.speedtest.net"]
 CUSTOM_ADDRESSES_LOCK = asyncio.Lock()
 
-CUSTOM_DOMAINS: list = []   # دامنه‌های اضافی برای ساخت کانفیگ
+CUSTOM_DOMAINS: list = []   # Extra domains for config generation
 CUSTOM_DOMAINS_LOCK = asyncio.Lock()
 
 SESSION_COOKIE = "ren_session"
@@ -2468,10 +2468,7 @@ body{font-family:'Inter',sans-serif;color:var(--text);display:flex;flex-directio
         <div class="page-eyebrow">Routing</div>
         <div class="page-header-row">
           <div><div class="page-title">Clean IP</div><div class="page-sub">Subscription alternative addresses</div></div>
-          <div style="display:flex;gap:8px">
-            <button class="btn btn-ghost" onclick="pingAllAddrs()">⚡ Ping All</button>
-            <button class="btn btn-gold" onclick="showAddAddrMo()">+ Add</button>
-          </div>
+          <button class="btn btn-gold" onclick="showAddAddrMo()">+ Add</button>
         </div>
         <div class="page-rule"></div>
       </div>
@@ -2486,7 +2483,7 @@ body{font-family:'Inter',sans-serif;color:var(--text);display:flex;flex-directio
       <div class="page-header">
         <div class="page-eyebrow">Config Domains</div>
         <div class="page-header-row">
-          <div><div class="page-title">Domains</div><div class="page-sub">دامنه‌های اضافی برای ساخت کانفیگ</div></div>
+          <div><div class="page-title">Domains</div><div class="page-sub">Extra domains for config generation</div></div>
           <button class="btn btn-gold" onclick="showAddDomainMo()">+ Add Domain</button>
         </div>
         <div class="page-rule"></div>
@@ -2629,7 +2626,7 @@ body{font-family:'Inter',sans-serif;color:var(--text);display:flex;flex-directio
   <div class="mo-box">
     <button class="mo-close" onclick="document.getElementById('mo-domain').classList.remove('show')">✕</button>
     <div class="mo-title">ADD DOMAIN</div>
-    <div class="fg"><label class="fl">Domain (بدون https://)</label><input class="fi" id="domain-input" placeholder="example.com" style="font-family:monospace"></div>
+    <div class="fg"><label class="fl">Domain (without https://)</label><input class="fi" id="nd" placeholder="example.com" style="font-family:monospace"></div>
     <button class="btn btn-gold" onclick="addDomain()" style="width:100%;justify-content:center;margin-top:12px;padding:12px;">ADD DOMAIN</button>
   </div>
 </div>
@@ -3259,53 +3256,10 @@ function renderAddrs(){
       <div><div style="font-size:14px;font-weight:600">${esc(a)}</div><div style="font-size:11px;color:var(--text3);margin-top:2px;">Address #${i+1}</div></div>
     </div>
     <div style="display:flex;align-items:center;gap:8px">
-      <span id="ping-${i}" style="font-family:'JetBrains Mono',monospace;font-size:11.5px;font-weight:600;color:var(--text3);min-width:58px;text-align:right">–</span>
-      <button class="act-btn act-copy" onclick="pingAddr('${esc(a)}',${i})">Ping</button>
+
       <button class="act-btn act-del" onclick="delAddr(${i})">Del</button>
     </div>
   </div>`).join('');
-  allAddrs.forEach((a,i)=>pingAddr(a,i));
-}
-
-function imgPing(url,timeoutMs){
-  return new Promise(resolve=>{
-    const img=new Image();
-    const t0=performance.now();
-    let done=false;
-    const finish=ok=>{
-      if(done)return;
-      done=true;
-      resolve(ok?performance.now()-t0:null);
-    };
-    img.onload=()=>finish(true);
-    img.onerror=()=>finish(true); // a fast error still proves the round trip completed
-    setTimeout(()=>finish(false),timeoutMs);
-    img.src=url+(url.includes('?')?'&':'?')+'_t='+Date.now()+Math.random();
-  });
-}
-
-async function pingAddr(host,i){
-  const el=$m('ping-'+i);
-  if(!el)return;
-  el.textContent='…';
-  el.style.color='var(--text3)';
-  const samples=[];
-  for(let n=0;n<4;n++){
-    const ms=await imgPing('https://www.google.com/favicon.ico',2500);
-    if(ms!==null)samples.push(ms);
-  }
-  if(!samples.length){
-    el.textContent='timeout';
-    el.style.color='var(--red)';
-    return;
-  }
-  samples.sort((a,b)=>a-b);
-  const ms=Math.round(samples[Math.floor(samples.length/2)]); // median, less noisy than min/max
-  el.textContent=ms+' ms';
-  el.style.color=ms<150?'var(--green)':ms<350?'var(--yellow)':'var(--red)';
-}
-
-async function pingAllAddrs(){
   allAddrs.forEach((a,i)=>pingAddr(a,i));
 }
 
@@ -3466,7 +3420,7 @@ function renderDomains(){
   if(pd)pd.textContent=primaryDomain;
   if(!el)return;
   if(!allDomains.length){
-    el.innerHTML='<div style="color:var(--text3);font-size:12px;padding:8px 0">هنوز دامنه‌ای اضافه نشده — دامنه اضافه کن تا کانفیگ برای هر دو دامنه ساخته بشه.</div>';
+    el.innerHTML='<div style="color:var(--text3);font-size:12px;padding:8px 0">No extra domains yet — add a domain to generate configs for both.</div>';
     return;
   }
   el.innerHTML=allDomains.map((d,i)=>`
@@ -3478,12 +3432,12 @@ function renderDomains(){
 }
 
 function showAddDomainMo(){
-  $m('domain-input').value='';
+  $m('nd').value='';
   $m('mo-domain').classList.add('show');
 }
 
 async function addDomain(){
-  const domain=($m('domain-input').value||'').trim();
+  const domain=($m('nd').value||'').trim();
   if(!domain){toast('Domain is required',true);return;}
   try{
     const r=await fetch('/api/domains',{
